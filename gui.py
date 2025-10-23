@@ -517,13 +517,13 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             try:
                 import tool as _tool
                 new_images = _tool.load_all_images(config)
-                if new_images:
-                    try:
-                        with gui_state['lock']:
-                            gui_state['images_data'] = new_images
-                            gui_state['reload_pixels'] = True
-                    except Exception:
-                        pass
+                # Always update gui_state with the latest images_data (may be empty list)
+                try:
+                    with gui_state['lock']:
+                        gui_state['images_data'] = new_images or []
+                        gui_state['reload_pixels'] = True
+                except Exception:
+                    pass
             except Exception:
                 pass
 
@@ -562,8 +562,9 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
                     images_data = new_images
                     try:
                         with gui_state['lock']:
-                            gui_state['images_data'] = images_data
-                            gui_state['reload_pixels'] = True
+                                # Update even if images_data is empty to ensure backend rebuilds target_map
+                                gui_state['images_data'] = images_data or []
+                                gui_state['reload_pixels'] = True
                     except Exception:
                         pass
                     # 在主线程刷新树视图
@@ -573,7 +574,9 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
                         pass
                 else:
                     try:
-                        root.after(0, lambda: messagebox.showwarning('刷新', '未能加载到任何图片（检查路径/启用状态）。'))
+                            # 如果没有图片也要更新树视图并提示用户
+                            root.after(0, refresh_tree)
+                            root.after(0, lambda: messagebox.showwarning('刷新', '未能加载到任何图片（检查路径/启用状态）。'))
                     except Exception:
                         pass
             except Exception as e:

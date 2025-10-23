@@ -808,6 +808,19 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         is_open = not getattr(ws, "closed", False)
                 except Exception:
                     is_open = False
+                # 如果发送任务或接收任务意外退出，即使连接未显式标记为 closed，也认为连接已不健康，退出以便重连
+                try:
+                    if sender_task.done():
+                        logging.warning("检测到发送任务已退出，连接可能异常，退出当前循环以便重连。")
+                        break
+                except Exception:
+                    pass
+                try:
+                    if receiver_task.done():
+                        logging.warning("检测到接收任务已退出，连接可能异常，退出当前循环以便重连。")
+                        break
+                except Exception:
+                    pass
                 if not is_open:
                     logging.warning("检测到 WebSocket 已关闭，退出当前循环以便重连。")
                     break
@@ -1216,20 +1229,21 @@ def main():
             config.update(new_cfg)
             # 重新加载所有图片
             try:
-                new_images_data = tool.load_all_images(config)
-                if new_images_data:
-                    images_data = new_images_data
+                # Always update images_data with the latest result (may be empty list)
+                new_images_data = tool.load_all_images(config) or []
+                images_data = new_images_data
+                if images_data:
                     logging.info('已刷新所有图片数据（未重新获取 Token）。')
                 else:
-                    logging.warning('刷新配置时未能加载图片，保持原有图片。')
+                    logging.warning('刷新配置时未能加载到任何图片（可能都被禁用或路径无效）。')
             except Exception:
                 logging.exception('刷新配置时加载图片失败')
             # 如果 GUI 可用，更新 gui_state 的相关字段
             try:
                 if gui_available:
                     with gui_state['lock']:
+                        # Update gui_state even if images_data is empty so backend rebuilds its maps
                         gui_state['images_data'] = images_data
-                        # 通知后台任务重建 target_map
                         gui_state['reload_pixels'] = True
             except Exception:
                 logging.exception('刷新配置时更新 GUI 状态失败')
