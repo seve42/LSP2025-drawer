@@ -485,10 +485,10 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         # 限制握手与关闭超时，避免卡住；部分环境下可减轻“opening handshake 超时”的长期滞留
         async with websockets.connect(
             WS_URL,
-            ping_interval=20,
-            ping_timeout=20,
-            open_timeout=10,
-            close_timeout=5,
+            ping_interval=30,
+            ping_timeout=60,
+            open_timeout=15,
+            close_timeout=10,
         ) as ws:
             logging.info("WebSocket 连接已打开。")
             # 新连接建立时清空待发送队列，避免残留数据
@@ -522,83 +522,101 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
 
             # 启动接收任务：处理 Ping(0xfc)、绘画结果(0xff)、画板更新(0xfa) 等
             async def receiver():
+                """接收并处理服务器消息，增强异常处理和心跳响应"""
+                consecutive_errors = 0
+                max_consecutive_errors = 10
                 try:
                     async for message in ws:
-                        if isinstance(message, str):
-                            data = bytearray(message.encode())
-                        else:
-                            data = bytearray(message)
-                        offset = 0
-                        while offset < len(data):
-                            opcode = data[offset]
-                            offset += 1
-                            if opcode == 0xfc:  # Heartbeat Ping
-                                logging.debug("收到 Ping，发送 Pong。")
-                                await ws.send(bytes([0xfb]))
-                            elif opcode == 0xff:  # 绘画结果
-                                if offset + 5 > len(data):
-                                    break
-                                paint_id = int.from_bytes(data[offset:offset+4], 'little')
-                                status_code = data[offset+4]
-                                logging.debug(f"收到绘画结果: ID={paint_id}, 状态=0x{status_code:x}")
-                                offset += 5
-                            elif opcode == 0xfa:  # 画板像素更新广播 x(2) y(2) rgb(3)
-                                if offset + 7 > len(data):
-                                    break
-                                try:
-                                    x = int.from_bytes(data[offset:offset+2], 'little'); offset += 2
-                                    y = int.from_bytes(data[offset:offset+2], 'little'); offset += 2
-                                    r, g, b = data[offset], data[offset+1], data[offset+2]; offset += 3
-                                    board_state[(x, y)] = (r, g, b)
-                                    logging.debug(f"画板更新: ({x},{y}) -> ({r},{g},{b})")
-                                    # attribute this board update to any pending paint that tried to set same pos/color recently
+                        try:
+                            if isinstance(message, str):
+                                data = bytearray(message.encode())
+                            else:
+                                data = bytearray(message)
+                            offset = 0
+                            while offset < len(data):
+                                opcode = data[offset]
+                                offset += 1
+                                if opcode == 0xfc:  # Heartbeat Ping
+                                    logging.debug("收到 Ping，发送 Pong。")
                                     try:
-                                        now = time.monotonic()
-                                        matched = None
-                                        # find a pending paint that matches (x,y) and color within timeout
-                                        for p in list(pending_paints):
-                                            if p['pos'] == (x, y) and p['color'] == (r, g, b) and now - p['time'] <= PENDING_TIMEOUT:
-                                                matched = p
-                                                break
-                                        if matched is not None:
-                                            uid_matched = matched['uid']
-                                            # record into user's last snapshot (ordered dict to keep recent entries)
-                                            snap = user_last_snapshot.get(uid_matched)
-                                            if snap is None:
-                                                snap = OrderedDict()
-                                                user_last_snapshot[uid_matched] = snap
-                                            snap[matched['pos']] = matched['color']
-                                            # keep only latest SNAPSHOT_SIZE items
-                                            while len(snap) > SNAPSHOT_SIZE:
-                                                snap.popitem(last=False)
-                                            # remove matched pending paint
-                                            try:
-                                                pending_paints.remove(matched)
-                                            except Exception:
-                                                pass
-                                    except Exception:
-                                        pass
-                                    # 若更新触及目标区域，唤醒调度器以便即时修复
-                                    if (x, y) in target_map:
-                                        state_changed_event.set()
-                                    # 同步到 GUI（实时画板预览）
-                                    if gui_state is not None:
+                                        await ws.send(bytes([0xfb]))
+                                        consecutive_errors = 0  # 成功响应心跳后重置错误计数
+                                    except Exception as e:
+                                        logging.warning(f"响应 Pong 失败: {e}")
+                                        consecutive_errors += 1
+                                        if consecutive_errors >= max_consecutive_errors:
+                                            logging.error("心跳响应连续失败，接收任务退出。")
+                                            return
+                                elif opcode == 0xff:  # 绘画结果
+                                    if offset + 5 > len(data):
+                                        break
+                                    paint_id = int.from_bytes(data[offset:offset+4], 'little')
+                                    status_code = data[offset+4]
+                                    logging.debug(f"收到绘画结果: ID={paint_id}, 状态=0x{status_code:x}")
+                                    offset += 5
+                                elif opcode == 0xfa:  # 画板像素更新广播 x(2) y(2) rgb(3)
+                                    if offset + 7 > len(data):
+                                        break
+                                    try:
+                                        x = int.from_bytes(data[offset:offset+2], 'little'); offset += 2
+                                        y = int.from_bytes(data[offset:offset+2], 'little'); offset += 2
+                                        r, g, b = data[offset], data[offset+1], data[offset+2]; offset += 3
+                                        board_state[(x, y)] = (r, g, b)
+                                        logging.debug(f"画板更新: ({x},{y}) -> ({r},{g},{b})")
+                                        # attribute this board update to any pending paint that tried to set same pos/color recently
                                         try:
-                                            with gui_state['lock']:
-                                                gui_state['board_state'][(x, y)] = (r, g, b)
+                                            now = time.monotonic()
+                                            matched = None
+                                            # find a pending paint that matches (x,y) and color within timeout
+                                            for p in list(pending_paints):
+                                                if p['pos'] == (x, y) and p['color'] == (r, g, b) and now - p['time'] <= PENDING_TIMEOUT:
+                                                    matched = p
+                                                    break
+                                            if matched is not None:
+                                                uid_matched = matched['uid']
+                                                # record into user's last snapshot (ordered dict to keep recent entries)
+                                                snap = user_last_snapshot.get(uid_matched)
+                                                if snap is None:
+                                                    snap = OrderedDict()
+                                                    user_last_snapshot[uid_matched] = snap
+                                                snap[matched['pos']] = matched['color']
+                                                # keep only latest SNAPSHOT_SIZE items
+                                                while len(snap) > SNAPSHOT_SIZE:
+                                                    snap.popitem(last=False)
+                                                # remove matched pending paint
+                                                try:
+                                                    pending_paints.remove(matched)
+                                                except Exception:
+                                                    pass
                                         except Exception:
                                             pass
-                                    # 清理过期的 pending_paints
-                                    try:
-                                        now = time.monotonic()
-                                        pending_paints[:] = [p for p in pending_paints if now - p['time'] <= PENDING_TIMEOUT]
+                                        # 若更新触及目标区域，唤醒调度器以便即时修复
+                                        if (x, y) in target_map:
+                                            state_changed_event.set()
+                                        # 同步到 GUI（实时画板预览）
+                                        if gui_state is not None:
+                                            try:
+                                                with gui_state['lock']:
+                                                    gui_state['board_state'][(x, y)] = (r, g, b)
+                                            except Exception:
+                                                pass
+                                        # 清理过期的 pending_paints
+                                        try:
+                                            now = time.monotonic()
+                                            pending_paints[:] = [p for p in pending_paints if now - p['time'] <= PENDING_TIMEOUT]
+                                        except Exception:
+                                            pass
                                     except Exception:
+                                        # 出错则跳过此条
                                         pass
-                                except Exception:
-                                    # 出错则跳过此条
-                                    pass
-                            else:
-                                logging.warning(f"收到未知操作码: 0x{opcode:x}")
+                                else:
+                                    logging.warning(f"收到未知操作码: 0x{opcode:x}")
+                        except Exception as e:
+                            logging.warning(f"处理消息时出错: {e}")
+                            consecutive_errors += 1
+                            if consecutive_errors >= max_consecutive_errors:
+                                logging.error("消息处理连续失败，接收任务退出。")
+                                break
                 except websockets.exceptions.ConnectionClosed as e:
                     logging.info(f"WebSocket 连接已关闭: {e}")
                 except asyncio.CancelledError:
@@ -800,6 +818,10 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                 pass
             rr_cursor = 0
 
+            # 健康检查：定期验证连接和任务状态
+            last_health_check = time.monotonic()
+            health_check_interval = 30  # 每30秒检查一次
+            
             while True:
                 # 若连接已关闭，则退出以便外层重连
                 try:
@@ -808,7 +830,38 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         is_open = not getattr(ws, "closed", False)
                 except Exception:
                     is_open = False
-                # 如果发送任务或接收任务意外退出，即使连接未显式标记为 closed，也认为连接已不健康，退出以便重连
+                    
+                # 定期健康检查
+                now = time.monotonic()
+                if now - last_health_check >= health_check_interval:
+                    last_health_check = now
+                    if not is_open:
+                        logging.warning("健康检查：检测到 WebSocket 已关闭，退出以便重连。")
+                        break
+                    # 检查发送和接收任务状态
+                    try:
+                        if sender_task.done():
+                            exc = sender_task.exception() if not sender_task.cancelled() else None
+                            if exc:
+                                logging.error(f"发送任务异常退出: {exc}")
+                            else:
+                                logging.warning("发送任务已退出")
+                            break
+                    except Exception:
+                        pass
+                    try:
+                        if receiver_task.done():
+                            exc = receiver_task.exception() if not receiver_task.cancelled() else None
+                            if exc:
+                                logging.error(f"接收任务异常退出: {exc}")
+                            else:
+                                logging.warning("接收任务已退出")
+                            break
+                    except Exception:
+                        pass
+                    logging.debug(f"健康检查通过：连接正常，发送/接收任务运行中")
+                
+                # 快速检查任务状态（不记录，只用于快速退出）
                 try:
                     if sender_task.done():
                         logging.warning("检测到发送任务已退出，连接可能异常，退出当前循环以便重连。")
@@ -1019,25 +1072,43 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
 
     当网络断开、服务器重启或偶发异常导致内部循环退出时，按指数回退重连，
     直到收到 GUI 停止信号或进程被终止。
+    
+    优化：
+    - 更智能的退避策略
+    - 连接成功后重置退避
+    - 详细的重连日志
     """
     backoff = 1.0
     backoff_max = 60.0
+    reconnect_count = 0
+    last_successful_duration = 0
+    
     while True:
         # GUI 请求停止则退出
         if gui_state is not None and gui_state.get('stop'):
             logging.info('检测到停止标记，结束 run_forever 循环。')
             break
+        reconnect_count += 1
         try:
+            logging.info(f"{'初始' if reconnect_count == 1 else '重'}连接 WebSocket (第 {reconnect_count} 次)...")
             duration = await handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state)
+            last_successful_duration = duration if isinstance(duration, (int, float)) else 0
+            
             # 若自然返回且未设置停止，视为异常退出，进入重连
             if gui_state is not None and gui_state.get('stop'):
                 break
-            logging.warning('主循环意外结束，将在短暂等待后尝试重连。')
-            # 若本次连接持续了一段时间（例如 >=30s），认为网络/服务恢复过，重置退避
+            logging.warning(f'主循环意外结束（运行时长: {duration:.1f}s），将在短暂等待后尝试重连。')
+            
+            # 若本次连接持续了一段时间（例如 >=60s），认为连接稳定，重置退避和计数
             try:
-                if isinstance(duration, (int, float)) and duration >= 30.0:
+                if isinstance(duration, (int, float)) and duration >= 60.0:
                     backoff = 1.0
-                    logging.info('连接持续时间较长，已重置重连退避为 1.0s。')
+                    reconnect_count = 0
+                    logging.info(f'连接持续时间较长({duration:.1f}s)，已重置重连退避和计数。')
+                elif isinstance(duration, (int, float)) and duration >= 30.0:
+                    # 部分重置退避
+                    backoff = max(1.0, backoff / 2)
+                    logging.info(f'连接持续时间中等({duration:.1f}s)，已降低重连退避至 {backoff:.1f}s。')
             except Exception:
                 pass
         except (websockets.exceptions.ConnectionClosedError,
@@ -1047,20 +1118,27 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
                 asyncio.TimeoutError) as e:
             # 某些异常的 str 可能为空，补充类型名便于诊断
             err_text = str(e) or e.__class__.__name__
-            logging.warning(f'连接中断或超时：{err_text}，准备重连。')
-        except Exception:
-            logging.exception('运行过程中出现未预期异常，准备重连。')
+            logging.warning(f'连接中断或超时 (第 {reconnect_count} 次)：{err_text}，准备重连。')
+            # 网络相关异常，适度增加退避
+            if last_successful_duration >= 10.0:
+                # 如果之前连接稳定过，使用较小的退避增长
+                backoff = min(backoff * 1.5, backoff_max)
+            else:
+                backoff = min(backoff * 2.0, backoff_max)
+        except Exception as e:
+            logging.exception(f'运行过程中出现未预期异常 (第 {reconnect_count} 次)，准备重连。')
+            # 未预期异常，使用较大的退避
+            backoff = min(backoff * 2.5, backoff_max)
 
         # 指数回退的等待；等待期间可响应停止
         wait_left = backoff
-        logging.info(f'将在 {wait_left:.1f}s 后重连。')
+        logging.info(f'将在 {wait_left:.1f}s 后进行第 {reconnect_count + 1} 次重连尝试 (累计重连: {reconnect_count} 次)。')
         while wait_left > 0:
             if gui_state is not None and gui_state.get('stop'):
                 logging.info('检测到停止标记，放弃重连等待。')
                 return
             await asyncio.sleep(min(1.0, wait_left))
             wait_left -= 1.0
-        backoff = min(backoff * 2.0, backoff_max)
     logging.info('run_forever 正常退出。')
 
 
