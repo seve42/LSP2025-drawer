@@ -479,8 +479,17 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
     if _saved_env:
         logging.debug("检测到环境代理变量，已临时清除以建立直接 WebSocket 连接。")
 
+    # 记录本次连接开始时间，供上层决定是否重置退避
+    conn_started_at = time.monotonic()
     try:
-        async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
+        # 限制握手与关闭超时，避免卡住；部分环境下可减轻“opening handshake 超时”的长期滞留
+        async with websockets.connect(
+            WS_URL,
+            ping_interval=20,
+            ping_timeout=20,
+            open_timeout=10,
+            close_timeout=5,
+        ) as ws:
             logging.info("WebSocket 连接已打开。")
             # 新连接建立时清空待发送队列，避免残留数据
             try:
@@ -985,6 +994,11 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         if _saved_env:
             os.environ.update(_saved_env)
             logging.debug("已恢复环境代理变量。")
+    # 将连接持续时长通过返回值暴露给上层（用于退避重置判定）
+    try:
+        return max(0.0, time.monotonic() - conn_started_at)
+    except Exception:
+        return 0.0
 
 
 async def run_forever(config, users_with_tokens, images_data, debug=False, gui_state=None):
@@ -1001,17 +1015,26 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
             logging.info('检测到停止标记，结束 run_forever 循环。')
             break
         try:
-            await handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state)
+            duration = await handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state)
             # 若自然返回且未设置停止，视为异常退出，进入重连
             if gui_state is not None and gui_state.get('stop'):
                 break
             logging.warning('主循环意外结束，将在短暂等待后尝试重连。')
+            # 若本次连接持续了一段时间（例如 >=30s），认为网络/服务恢复过，重置退避
+            try:
+                if isinstance(duration, (int, float)) and duration >= 30.0:
+                    backoff = 1.0
+                    logging.info('连接持续时间较长，已重置重连退避为 1.0s。')
+            except Exception:
+                pass
         except (websockets.exceptions.ConnectionClosedError,
                 websockets.exceptions.ConnectionClosedOK,
                 websockets.exceptions.InvalidStatusCode,
                 OSError,
                 asyncio.TimeoutError) as e:
-            logging.warning(f'连接中断或超时：{e}，准备重连。')
+            # 某些异常的 str 可能为空，补充类型名便于诊断
+            err_text = str(e) or e.__class__.__name__
+            logging.warning(f'连接中断或超时：{err_text}，准备重连。')
         except Exception:
             logging.exception('运行过程中出现未预期异常，准备重连。')
 
