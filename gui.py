@@ -271,12 +271,32 @@ def start_gui(config, pixels, width, height, users_with_tokens, gui_state):
             mismatched = int(gui_state.get('mismatched', 0))
             available = int(gui_state.get('available', 0))
             ready = int(gui_state.get('ready_count', 0))
+            resistance_pct = gui_state.get('resistance_pct', None)
+            user_covered = dict(gui_state.get('user_covered', {}))
             # 读取最新 start_x/y 以便红框更新
             sx = int(gui_state.get('start_x', config.get('start_x', 0)))
             sy = int(gui_state.get('start_y', config.get('start_y', 0)))
         pct = 100.0 if total <= 0 else max(0.0, min(100.0, (total - mismatched) * 100.0 / max(1, total)))
         progress_var.set(pct)
-        lbl_info.config(text=f"进度: {pct:6.2f}%  总像素: {total}  未达标: {mismatched}  可用用户: {available} (就绪:{ready})  起点: ({sx},{sy}) 大小: {width}x{height}")
+        # 构建抵抗率显示：优先显示全局 resistance_pct，否则显示每用户覆盖标记（最多 5 个）
+        res_summary = ''
+        try:
+            if resistance_pct is not None:
+                res_summary = f'  抵抗率: {resistance_pct:5.1f}%'
+            else:
+                parts = []
+                shown = 0
+                for uid, covered in user_covered.items():
+                    if shown >= 5:
+                        break
+                    parts.append(f"{uid}:{'Y' if covered else 'N'}")
+                    shown += 1
+                if parts:
+                    res_summary = '  抵抗: ' + ' '.join(parts)
+        except Exception:
+            res_summary = ''
+
+        lbl_info.config(text=f"进度: {pct:6.2f}%  总像素: {total}  未达标: {mismatched}  可用用户: {available} (就绪:{ready})  起点: ({sx},{sy}) 大小: {width}x{height}" + res_summary)
 
     # 定时器：每秒刷新文字与图像；底图构建每 30 秒处理一次
     def tick():

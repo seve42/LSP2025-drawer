@@ -2,3 +2,4 @@ config.json
 image.png
 paint.log
 promot.md
+__pycache__/*

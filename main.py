@@ -11,6 +11,7 @@ import sys
 from uuid import UUID
 from PIL import Image
 import threading
+from collections import OrderedDict
 
 # --- 全局配置 ---
 API_BASE_URL = "https://paintboard.luogu.me"
@@ -29,6 +30,13 @@ logging.basicConfig(
 # 发送粘包所用的全局队列
 paint_queue = []
 total_size = 0
+# pending paints waiting for confirmation via board update: list of dicts {uid, paint_id, pos, color, time}
+pending_paints = []
+# per-user snapshot of their most recent successful painted pixels: uid -> OrderedDict[(x,y) -> (r,g,b)]
+user_last_snapshot = {}
+# configuration for snapshot size and pending timeout (seconds)
+SNAPSHOT_SIZE = 100
+PENDING_TIMEOUT = 10.0
 
 def save_config(config: dict):
     """保存配置到本地 config.json"""
@@ -113,22 +121,74 @@ async def send_paint_data(ws, interval_ms):
                 except Exception as e:
                     logging.error(f"发送数据时出错: {e}")
 
-def build_target_map(pixels, width, height, start_x, start_y):
-    """构建目标像素颜色映射：{(abs_x,abs_y): (r,g,b)}，跳过透明与越界"""
+def build_target_map(pixels, width, height, start_x, start_y, config=None):
+    """构建目标像素颜色映射：{(abs_x,abs_y): (r,g,b)}，跳过透明与越界。
+
+    更健壮地支持像素格式：RGBA、RGB、灰度等。若像素带 alpha 通道且 alpha==0 则视为透明并跳过。
+    若配置中设置 `ignore_semitransparent` 为 True，则 alpha<255 的像素也会被视为透明并跳过。
+    """
     target = {}
+    skipped_transparent = 0
+    skipped_out_of_bounds = 0
+    ignore_semi = False
+    if isinstance(config, dict):
+        ignore_semi = bool(config.get('ignore_semitransparent', False))
+
+    total_pixels = width * height
     for py in range(height):
         for px in range(width):
             idx = py * width + px
+            if idx < 0 or idx >= len(pixels):
+                continue
+            p = pixels[idx]
             try:
-                r, g, b, a = pixels[idx]
+                # 支持多种像素表示
+                if isinstance(p, (list, tuple)):
+                    if len(p) >= 4:
+                        r, g, b, a = p[0], p[1], p[2], p[3]
+                    elif len(p) == 3:
+                        r, g, b = p
+                        a = 255
+                    elif len(p) == 1:
+                        r = g = b = p[0]
+                        a = 255
+                    else:
+                        # 未识别格式，视为透明
+                        skipped_transparent += 1
+                        continue
+                else:
+                    # 纯整数等情况，视为灰度
+                    r = g = b = int(p)
+                    a = 255
             except Exception:
+                skipped_transparent += 1
                 continue
-            if a == 0:
-                continue
+
+            # 跳过完全透明像素
+            try:
+                if int(a) == 0:
+                    skipped_transparent += 1
+                    continue
+            except Exception:
+                # 若无法解析 alpha，则保守处理为可见
+                pass
+
+            # 可选：跳过半透明像素
+            if ignore_semi:
+                try:
+                    if 0 < int(a) < 255:
+                        skipped_transparent += 1
+                        continue
+                except Exception:
+                    pass
+
             abs_x, abs_y = start_x + px, start_y + py
             if 0 <= abs_x < 1000 and 0 <= abs_y < 600:
-                target[(abs_x, abs_y)] = (r, g, b)
-    logging.info(f"目标像素数: {len(target)}（非透明且在画布范围内）")
+                target[(abs_x, abs_y)] = (int(r), int(g), int(b))
+            else:
+                skipped_out_of_bounds += 1
+
+    logging.info(f"目标像素数: {len(target)}（非透明且在画布范围内） 已跳过透明: {skipped_transparent} 越界: {skipped_out_of_bounds} 总像素: {total_pixels}")
     return target
 
 
@@ -405,6 +465,33 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                                     r, g, b = data[offset], data[offset+1], data[offset+2]; offset += 3
                                     board_state[(x, y)] = (r, g, b)
                                     logging.debug(f"画板更新: ({x},{y}) -> ({r},{g},{b})")
+                                    # attribute this board update to any pending paint that tried to set same pos/color recently
+                                    try:
+                                        now = time.monotonic()
+                                        matched = None
+                                        # find a pending paint that matches (x,y) and color within timeout
+                                        for p in list(pending_paints):
+                                            if p['pos'] == (x, y) and p['color'] == (r, g, b) and now - p['time'] <= PENDING_TIMEOUT:
+                                                matched = p
+                                                break
+                                        if matched is not None:
+                                            uid_matched = matched['uid']
+                                            # record into user's last snapshot (ordered dict to keep recent entries)
+                                            snap = user_last_snapshot.get(uid_matched)
+                                            if snap is None:
+                                                snap = OrderedDict()
+                                                user_last_snapshot[uid_matched] = snap
+                                            snap[matched['pos']] = matched['color']
+                                            # keep only latest SNAPSHOT_SIZE items
+                                            while len(snap) > SNAPSHOT_SIZE:
+                                                snap.popitem(last=False)
+                                            # remove matched pending paint
+                                            try:
+                                                pending_paints.remove(matched)
+                                            except Exception:
+                                                pass
+                                    except Exception:
+                                        pass
                                     # 若更新触及目标区域，唤醒调度器以便即时修复
                                     if (x, y) in target_map:
                                         state_changed_event.set()
@@ -415,6 +502,12 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                                                 gui_state['board_state'][(x, y)] = (r, g, b)
                                         except Exception:
                                             pass
+                                    # 清理过期的 pending_paints
+                                    try:
+                                        now = time.monotonic()
+                                        pending_paints[:] = [p for p in pending_paints if now - p['time'] <= PENDING_TIMEOUT]
+                                    except Exception:
+                                        pass
                                 except Exception:
                                     # 出错则跳过此条
                                     pass
@@ -457,6 +550,38 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                         # 非 debug 模式：只在控制台打印进度条（刷新）
                         sys.stdout.write('\r' + line)
                         sys.stdout.flush()
+                    # 计算用户级“被覆盖率”并得出全局抵抗率：
+                    # 抵抗率定义（按你的要求）：在所有用户中，统计其上次作画的像素是否被覆盖（若 snapshot 中任意像素与当前画板不同则视为被覆盖），
+                    # 抵抗率 = 被覆盖的用户数 / 总用户数 * 100%
+                    resistance_pct = None
+                    user_covered = {}
+                    try:
+                        total_users = len(users_with_tokens)
+                        covered = 0
+                        for u in users_with_tokens:
+                            uid = u['uid']
+                            snap = user_last_snapshot.get(uid)
+                            covered_flag = False
+                            if snap and len(snap) > 0:
+                                # 若 snapshot 中存在任一像素与当前画板不一致，则认为该用户的上次作画被覆盖
+                                for pos, color in snap.items():
+                                    cur = board_state.get(pos)
+                                    if cur is None or cur != color:
+                                        covered_flag = True
+                                        break
+                            else:
+                                # 无 snapshot 的用户视为未被覆盖（按定义只统计已有快照的覆盖情况）
+                                covered_flag = False
+                            user_covered[uid] = covered_flag
+                            if covered_flag:
+                                covered += 1
+                        if total_users > 0:
+                            resistance_pct = (covered / total_users) * 100.0
+                        else:
+                            resistance_pct = None
+                    except Exception:
+                        resistance_pct = None
+                        user_covered = {}
                     # 更新 GUI 状态
                     if gui_state is not None:
                         with gui_state['lock']:
@@ -464,6 +589,16 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                             gui_state['mismatched'] = mismatched
                             gui_state['available'] = len(users_with_tokens)
                             gui_state['ready_count'] = ready_count
+                            gui_state['resistance_pct'] = resistance_pct
+                            gui_state['user_covered'] = user_covered
+                    # 在 CLI 中附加简短的抵抗率展示
+                    try:
+                        if resistance_pct is None:
+                            line = line + '  |  抵抗率: --'
+                        else:
+                            line = line + f'  |  抵抗率: {resistance_pct:5.1f}%'
+                    except Exception:
+                        pass
                     # 若 GUI 请求停止则退出循环
                     if gui_state is not None and gui_state.get('stop'):
                         logging.info('收到 GUI 退出信号，结束调度循环。')
@@ -530,6 +665,11 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                         token = user['token']
                         paint_id = user_counters[uid]
                         await paint(ws, uid, token, r, g, b, x, y, paint_id)
+                        # 记录 pending paint，待画板更新广播到来时归属成功绘制
+                        try:
+                            pending_paints.append({'uid': uid, 'paint_id': paint_id, 'pos': (x, y), 'color': (r, g, b), 'time': time.monotonic()})
+                        except Exception:
+                            pass
                         logging.info(f"UID {uid} 播报绘制像素: ({x},{y}) color=({r},{g},{b}) id={paint_id}")
                         user_counters[uid] = paint_id + 1
                         cooldown_until[uid] = now + user_cooldown_seconds
