@@ -185,7 +185,10 @@ def get_draw_order(mode: str, width: int, height: int):
 
 
 def load_image_pixels(config):
-    """根据配置加载目标图片，返回 (pixels,width,height)。pixels 为 RGBA 四元组列表。"""
+    """根据配置加载目标图片，返回 (pixels,width,height)。pixels 为 RGBA 四元组列表。
+    
+    兼容旧配置格式（单个 image_path）和新格式（images 列表）
+    """
     image_path = config.get('image_path')
     if not image_path or not os.path.exists(image_path):
         logging.error(f"找不到目标图片: {image_path}")
@@ -199,3 +202,109 @@ def load_image_pixels(config):
     except Exception:
         logging.exception("加载目标图片失败")
         return None, 0, 0
+
+
+def load_all_images(config):
+    """加载所有启用的图片配置，返回图片信息列表。
+    
+    返回格式：[
+        {
+            'pixels': [...],
+            'width': int,
+            'height': int,
+            'start_x': int,
+            'start_y': int,
+            'draw_mode': str,
+            'weight': float,
+            'image_path': str
+        },
+        ...
+    ]
+    """
+    images_config = config.get('images', [])
+    
+    # 如果没有 images 配置，尝试兼容旧格式
+    if not images_config:
+        image_path = config.get('image_path')
+        if image_path:
+            images_config = [{
+                'image_path': image_path,
+                'start_x': config.get('start_x', 0),
+                'start_y': config.get('start_y', 0),
+                'draw_mode': config.get('draw_mode', 'random'),
+                'weight': 1.0,
+                'enabled': True
+            }]
+    
+    loaded_images = []
+    for img_config in images_config:
+        if not img_config.get('enabled', True):
+            continue
+            
+        image_path = img_config.get('image_path')
+        if not image_path or not os.path.exists(image_path):
+            logging.warning(f"跳过不存在的图片: {image_path}")
+            continue
+            
+        try:
+            img = Image.open(image_path).convert('RGBA')
+            width, height = img.size
+            pixels = list(img.getdata())
+            
+            loaded_images.append({
+                'pixels': pixels,
+                'width': width,
+                'height': height,
+                'start_x': int(img_config.get('start_x', 0)),
+                'start_y': int(img_config.get('start_y', 0)),
+                'draw_mode': img_config.get('draw_mode', 'random'),
+                'weight': float(img_config.get('weight', 1.0)),
+                'image_path': image_path
+            })
+            logging.info(f"已加载图片: {image_path} 大小: {width}x{height} 权重: {img_config.get('weight', 1.0)}")
+        except Exception:
+            logging.exception(f"加载图片失败: {image_path}")
+            
+    return loaded_images
+
+
+def merge_target_maps(images_data):
+    """合并多个图片的目标映射，处理重叠像素（按权重优先级）。
+    
+    返回：
+    - combined_target_map: {(x,y): (r,g,b)} 合并后的目标像素映射
+    - target_positions_by_mode: {draw_mode: [(x,y), ...]} 按绘制模式分组的坐标列表
+    """
+    # 首先按权重排序（权重高的优先）
+    sorted_images = sorted(images_data, key=lambda x: x['weight'], reverse=True)
+    
+    combined_target_map = {}
+    positions_by_mode = {}
+    
+    for img_data in sorted_images:
+        pixels = img_data['pixels']
+        width = img_data['width']
+        height = img_data['height']
+        start_x = img_data['start_x']
+        start_y = img_data['start_y']
+        draw_mode = img_data['draw_mode']
+        
+        # 构建该图片的目标映射
+        target_map = build_target_map(pixels, width, height, start_x, start_y)
+        
+        # 生成绘制顺序
+        ordered_coords = get_draw_order(draw_mode, width, height)
+        
+        # 转换为绝对坐标并记录
+        if draw_mode not in positions_by_mode:
+            positions_by_mode[draw_mode] = []
+            
+        for x, y in ordered_coords:
+            abs_pos = (start_x + x, start_y + y)
+            if abs_pos in target_map:
+                # 只有当该位置还未被更高权重的图片占用时才添加
+                if abs_pos not in combined_target_map:
+                    combined_target_map[abs_pos] = target_map[abs_pos]
+                    positions_by_mode[draw_mode].append(abs_pos)
+    
+    return combined_target_map, positions_by_mode

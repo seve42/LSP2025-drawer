@@ -195,10 +195,16 @@ def fetch_board_snapshot():
 
     如果请求失败，返回空 dict（上层会把未知像素视为未达标）。
     """
+    # 临时移除代理环境变量
+    proxy_keys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
+    _saved_env = {}
+    for _k in proxy_keys:
+        if _k in os.environ:
+            _saved_env[_k] = os.environ.pop(_k)
+
     url = f"{API_BASE_URL}/api/paintboard/getboard"
     try:
         session = requests.Session()
-        session.trust_env = False
         resp = session.get(url, timeout=10)
         resp.raise_for_status()
         data = resp.content
@@ -228,6 +234,10 @@ def fetch_board_snapshot():
     except Exception as e:
         logging.exception(f"解析画板快照时出现异常: {e}")
         return {}
+    finally:
+        # 恢复环境变量
+        if _saved_env:
+            os.environ.update(_saved_env)
 
 
 def get_draw_order(mode: str, width: int, height: int):
@@ -263,17 +273,35 @@ def load_config():
         cfg.setdefault('paint_interval_ms', 20)
         cfg.setdefault('round_interval_seconds', 30)
         cfg.setdefault('user_cooldown_seconds', 30)
-        cfg.setdefault('draw_mode', 'random')
-        cfg.setdefault('image_path', 'image.png')
-        cfg.setdefault('start_x', 0)
-        cfg.setdefault('start_y', 0)
         cfg.setdefault('users', [])
+        
+        # 兼容旧配置格式：如果有 image_path 但没有 images，则创建 images 列表
+        if 'image_path' in cfg and 'images' not in cfg:
+            cfg['images'] = [{
+                'image_path': cfg.get('image_path', 'image.png'),
+                'start_x': cfg.get('start_x', 0),
+                'start_y': cfg.get('start_y', 0),
+                'draw_mode': cfg.get('draw_mode', 'random'),
+                'weight': 1.0,
+                'enabled': True
+            }]
+        
+        # 如果没有 images 配置，创建默认配置
+        if 'images' not in cfg or not cfg['images']:
+            cfg['images'] = [{
+                'image_path': 'image.png',
+                'start_x': 0,
+                'start_y': 0,
+                'draw_mode': 'random',
+                'weight': 1.0,
+                'enabled': True
+            }]
+        
         return cfg
     except FileNotFoundError:
         logging.warning("找不到 config.json，正在创建默认配置...")
         # 生成默认配置并写入
         default_cfg = {
-            # 示例用户：请替换为真实 UID 与 AccessKey，或在 GUI 中添加用户
             "users": [
                 {
                     "uid": 114514,
@@ -281,19 +309,24 @@ def load_config():
                 }
             ],
             "paint_interval_ms": 20,
-            # 与 config.json.del 保持一致的默认值
             "round_interval_seconds": 3,
             "user_cooldown_seconds": 3,
-            "draw_mode": "concentric",
             "log_level": "INFO",
-            "image_path": "image.png",
-            "start_x": 66,
-            "start_y": 64
+            "images": [
+                {
+                    "image_path": "image.png",
+                    "start_x": 66,
+                    "start_y": 64,
+                    "draw_mode": "concentric",
+                    "weight": 1.0,
+                    "enabled": True
+                }
+            ]
         }
         try:
             with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
                 json.dump(default_cfg, f, ensure_ascii=False, indent=4)
-            logging.info("已创建默认 config.json，请根据需要编辑 users 与 image_path。")
+            logging.info("已创建默认 config.json，请根据需要编辑 users 与 images。")
             return default_cfg
         except Exception:
             logging.exception("创建默认 config.json 失败")
@@ -325,9 +358,15 @@ def load_image_pixels(config):
 
 def get_token(uid: int, access_key: str):
     """从服务端获取绘制 token。返回 token 字符串或 None。"""
+    # 临时移除代理环境变量
+    proxy_keys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
+    _saved_env = {}
+    for _k in proxy_keys:
+        if _k in os.environ:
+            _saved_env[_k] = os.environ.pop(_k)
+    
     try:
         session = requests.Session()
-        session.trust_env = False
         # 2025-10-14 文档与仓库说明：获取 Token 的接口为 POST /api/auth/gettoken
         url = f"{API_BASE_URL}/api/auth/gettoken"
         try:
@@ -363,31 +402,34 @@ def get_token(uid: int, access_key: str):
     except Exception as e:
         logging.warning(f"获取 token 失败 uid={uid}: {e}")
         return None
+    finally:
+        # 恢复环境变量
+        if _saved_env:
+            os.environ.update(_saved_env)
 
 
-async def handle_websocket(config, users_with_tokens, pixels, width, height, debug=False, gui_state=None):
+async def handle_websocket(config, users_with_tokens, images_data, debug=False, gui_state=None):
     """主 WebSocket 处理函数
 
     修复点：
     - 将发送/绘制/接收全部放入 WebSocket 上下文中，确保连接在任务期间保持打开。
     - 并发接收服务端消息，及时应答 0xfc 心跳为 0xfb，避免被断开。
+    - 支持多图片绘制，合并目标映射并按权重处理重叠
     """
-    draw_mode = config.get("draw_mode", "random")
-    start_x = config.get("start_x", 0)
-    start_y = config.get("start_y", 0)
     paint_interval_ms = config.get("paint_interval_ms", 20)
     round_interval_seconds = config.get("round_interval_seconds", 30)
     user_cooldown_seconds = config.get("user_cooldown_seconds", 30)
 
-    # 目标像素映射（绝对坐标 -> 目标 RGB）
-    target_map = tool.build_target_map(pixels, width, height, start_x, start_y)
+    # 合并所有图片的目标像素映射（处理重叠，高权重优先）
+    target_map, positions_by_mode = tool.merge_target_maps(images_data)
     
-    # 根据模式生成有序的绘画坐标
-    ordered_coords = tool.get_draw_order(draw_mode, width, height)
-    # 转换为绝对坐标
-    target_positions = [(start_x + x, start_y + y) for x, y in ordered_coords if (start_x + x, start_y + y) in target_map]
-    current_draw_mode = draw_mode
-    current_start_x, current_start_y = start_x, start_y
+    # 合并所有绘制模式的坐标列表（保持原有顺序）
+    target_positions = []
+    for mode in ['horizontal', 'concentric', 'random']:  # 按优先级合并
+        if mode in positions_by_mode:
+            target_positions.extend(positions_by_mode[mode])
+    
+    logging.info(f"已加载 {len(images_data)} 个图片，合并后共 {len(target_map)} 个目标像素")
 
     # 如果有 GUI 状态对象，初始化一些可视化字段
     if gui_state is not None:
@@ -396,9 +438,27 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
             gui_state['mismatched'] = len(target_positions)
             gui_state['available'] = len(users_with_tokens)
             gui_state['ready_count'] = len(users_with_tokens)
-            gui_state['target_bbox'] = (start_x, start_y, width, height)
+            gui_state['images_data'] = images_data  # 存储图片数据供 GUI 使用
             gui_state['stop'] = False
 
+
+    # 临时移除环境中的代理变量，避免 websockets 库自动通过 HTTP_PROXY/HTTPS_PROXY 走代理
+    proxy_keys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
+    _saved_env = {}
+    for _k in proxy_keys:
+        if _k in os.environ:
+            _saved_env[_k] = os.environ.pop(_k)
+    if _saved_env:
+        logging.info("检测到环境代理变量，已临时清除以建立直接 WebSocket 连接。")
+
+    # 临时移除环境中的代理变量，避免 websockets 库自动通过 HTTP_PROXY/HTTPS_PROXY 走代理
+    proxy_keys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
+    _saved_env = {}
+    for _k in proxy_keys:
+        if _k in os.environ:
+            _saved_env[_k] = os.environ.pop(_k)
+    if _saved_env:
+        logging.info("检测到环境代理变量，已临时清除以建立直接 WebSocket 连接。")
 
     # 临时移除环境中的代理变量，避免 websockets 库自动通过 HTTP_PROXY/HTTPS_PROXY 走代理
     proxy_keys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
@@ -523,8 +583,8 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
 
             # 启动进度显示器（每秒刷新）
             async def progress_printer():
-                # 模式前缀，例如: [模式:horizontal]
-                mode_prefix = f"[模式:{draw_mode}] "
+                # 模式前缀：显示多图片信息
+                mode_prefix = f"[{len(images_data)}图] "
                 # history of (time, pct) for averaging over window_seconds
                 history = deque()
                 window_seconds = 60.0
@@ -676,46 +736,21 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                     try:
                         with gui_state['lock']:
                             gui_state['reload_pixels'] = False
+                            updated_images_data = gui_state.get('images_data', images_data)
                         # 重新构建目标映射与绘制顺序
-                        target_map = tool.build_target_map(pixels, width, height, current_start_x, current_start_y)
-                        ordered_coords = tool.get_draw_order(current_draw_mode, width, height)
-                        target_positions = [(current_start_x + x, current_start_y + y) for x, y in ordered_coords if (current_start_x + x, current_start_y + y) in target_map]
+                        target_map, positions_by_mode = tool.merge_target_maps(updated_images_data)
+                        target_positions = []
+                        for mode in ['horizontal', 'concentric', 'random']:
+                            if mode in positions_by_mode:
+                                target_positions.extend(positions_by_mode[mode])
                         if gui_state is not None:
                             with gui_state['lock']:
                                 gui_state['total'] = len(target_positions)
-                                # mismatched 将在下一次 progress_printer 计算，这里尽量同步
                                 gui_state['mismatched'] = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
                         logging.info('已根据 GUI 请求刷新目标像素与绘制顺序。')
                     except Exception:
                         logging.exception('处理 GUI 刷新请求时出错')
 
-                # 检查 GUI 是否修改了绘制模式
-                if gui_state is not None:
-                    with gui_state['lock']:
-                        new_mode = gui_state.get('draw_mode', current_draw_mode)
-                        new_start_x = gui_state.get('start_x', current_start_x)
-                        new_start_y = gui_state.get('start_y', current_start_y)
-                else:
-                    new_mode = current_draw_mode
-                    new_start_x, new_start_y = current_start_x, current_start_y
-                if new_mode != current_draw_mode:
-                    logging.info(f"检测到模式切换: {current_draw_mode} -> {new_mode}，重新生成绘制顺序。")
-                    current_draw_mode = new_mode
-                    ordered_coords = tool.get_draw_order(current_draw_mode, width, height)
-                    target_positions = [(current_start_x + x, current_start_y + y) for x, y in ordered_coords if (current_start_x + x, current_start_y + y) in target_map]
-                    if gui_state is not None:
-                        with gui_state['lock']:
-                            gui_state['total'] = len(target_positions)
-                # 检查起点坐标变化
-                if (new_start_x, new_start_y) != (current_start_x, current_start_y):
-                    logging.info(f"检测到起点变化: ({current_start_x},{current_start_y}) -> ({new_start_x},{new_start_y})，重建目标映射与绘制顺序。")
-                    current_start_x, current_start_y = new_start_x, new_start_y
-                    target_map = tool.build_target_map(pixels, width, height, current_start_x, current_start_y)
-                    ordered_coords = tool.get_draw_order(current_draw_mode, width, height)
-                    target_positions = [(current_start_x + x, current_start_y + y) for x, y in ordered_coords if (current_start_x + x, current_start_y + y) in target_map]
-                    if gui_state is not None:
-                        with gui_state['lock']:
-                            gui_state['total'] = len(target_positions)
                 # 若 GUI 模式要求停止，退出循环
                 if gui_state is not None and gui_state.get('stop'):
                     logging.info('收到 GUI 退出信号，结束主循环。')
@@ -830,8 +865,10 @@ def main():
     if not config:
         return
 
-    pixels, width, height = load_image_pixels(config)
-    if not pixels:
+    # 加载所有图片
+    images_data = tool.load_all_images(config)
+    if not images_data:
+        logging.error("没有可用的图片配置，程序退出。")
         return
 
     # 获取 token 阶段：在 GUI 模式下显示进度条避免无响应感
@@ -938,7 +975,7 @@ def main():
             except Exception as e:
                 logging.warning(f"GUI 不可用，回退到 CLI：{e}")
 
-        # 定义刷新配置函数（仅刷新 image/pixels/start_x/start_y/draw_mode 等，不重新获取 token）
+        # 定义刷新配置函数（仅刷新图片配置，不重新获取 token）
         def refresh_config(new_cfg: dict):
             """在不重新获取 token 的情况下刷新运行期配置并更新 GUI 状态。"""
             try:
@@ -947,16 +984,14 @@ def main():
             except Exception:
                 logging.exception('保存配置失败')
             # 更新内存中的 config 引用
-            nonlocal config, pixels, width, height
+            nonlocal config, images_data
             config.update(new_cfg)
-            # 重新加载图片像素（若图片路径改变）
+            # 重新加载所有图片
             try:
-                px, w, h = tool.load_image_pixels(config)
-                if px:
-                    pixels = px
-                    width = w
-                    height = h
-                    logging.info('已刷新目标图片与像素数据（未重新获取 Token）。')
+                new_images_data = tool.load_all_images(config)
+                if new_images_data:
+                    images_data = new_images_data
+                    logging.info('已刷新所有图片数据（未重新获取 Token）。')
                 else:
                     logging.warning('刷新配置时未能加载图片，保持原有图片。')
             except Exception:
@@ -965,9 +1000,7 @@ def main():
             try:
                 if gui_available:
                     with gui_state['lock']:
-                        gui_state['start_x'] = int(config.get('start_x', gui_state.get('start_x', 0)))
-                        gui_state['start_y'] = int(config.get('start_y', gui_state.get('start_y', 0)))
-                        gui_state['draw_mode'] = config.get('draw_mode', gui_state.get('draw_mode'))
+                        gui_state['images_data'] = images_data
                         # 通知后台任务重建 target_map
                         gui_state['reload_pixels'] = True
             except Exception:
@@ -982,7 +1015,7 @@ def main():
 
         if cli_only or not gui_available:
             # 保持原有 CLI 行为
-            asyncio.run(handle_websocket(config, users_with_tokens, pixels, width, height, debug))
+            asyncio.run(handle_websocket(config, users_with_tokens, images_data, debug))
         else:
             # GUI 模式：创建线程安全的 gui_state 并在后台运行 asyncio
             gui_state = {
@@ -990,14 +1023,12 @@ def main():
                 'stop': False,
                 'board_state': {},
                 'overlay': False,
-                'draw_mode': config.get('draw_mode', 'random'),
-                'start_x': int(config.get('start_x', 0)),
-                'start_y': int(config.get('start_y', 0)),
+                'images_data': images_data,
             }
 
             def run_asyncio_loop():
                 try:
-                    asyncio.run(handle_websocket(config, users_with_tokens, pixels, width, height, debug, gui_state=gui_state))
+                    asyncio.run(handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state))
                 except Exception:
                     logging.exception('后台 asyncio 任务异常')
 
@@ -1006,7 +1037,7 @@ def main():
 
             # 启动 Tkinter GUI（主线程）
             try:
-                start_gui_func(config, pixels, width, height, users_with_tokens, gui_state)
+                start_gui_func(config, images_data, users_with_tokens, gui_state)
             finally:
                 # GUI 关闭时请求后台停止
                 with gui_state['lock']:
