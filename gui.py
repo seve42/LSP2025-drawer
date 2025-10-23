@@ -43,23 +43,198 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
     """启动 Tkinter GUI - 支持多图片管理。"""
     root = tk.Tk()
     root.title("LSP2025 Drawer - 多图片支持")
+    
+    # 设置默认窗口大小为1920×1080的1/4
+    default_width = 480
+    default_height = 270
+    root.geometry(f"{default_width}x{default_height}")
+    
+    # 允许窗口调整大小
+    root.minsize(400, 250)
 
     BOARD_W, BOARD_H = 1000, 600
+    # 画板预览缩放比例（默认缩小到1/3）
+    preview_scale = 0.25
 
-    # 主布局
-    main_paned = ttk.PanedWindow(root, orient=tk.VERTICAL)
-    main_paned.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    # 主布局 - 使用可滚动的Canvas
+    main_canvas = tk.Canvas(root)
+    main_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+    
+    # 添加垂直滚动条
+    v_scrollbar = ttk.Scrollbar(root, orient=tk.VERTICAL, command=main_canvas.yview)
+    v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+    main_canvas.configure(yscrollcommand=v_scrollbar.set)
+    
+    # 创建内部Frame来容纳所有内容
+    main_frame = ttk.Frame(main_canvas)
+    main_canvas_window = main_canvas.create_window((0, 0), window=main_frame, anchor='nw')
+    
+    # 绑定调整大小事件，并根据内容高度决定是否显示滚动条
+    def on_frame_configure(event=None):
+        # 更新滚动区域
+        try:
+            main_canvas.configure(scrollregion=main_canvas.bbox("all"))
+        except Exception:
+            pass
+        # 让内部frame的宽度跟随canvas
+        canvas_width = main_canvas.winfo_width()
+        if canvas_width > 1:
+            main_canvas.itemconfig(main_canvas_window, width=canvas_width)
+        # 根据内容高度决定是否显示滚动条
+        adjust_scrollbar_visibility()
 
-    # 顶部：画板预览
-    preview_frame = ttk.LabelFrame(main_paned, text="画板预览")
-    main_paned.add(preview_frame, weight=3)
+    main_frame.bind('<Configure>', on_frame_configure)
+    main_canvas.bind('<Configure>', on_frame_configure)
 
-    canvas = tk.Canvas(preview_frame, width=BOARD_W, height=BOARD_H, bg="#222")
-    canvas.pack()
+    # 鼠标滚轮处理函数（垂直滚动）
+    def on_mousewheel(event):
+        try:
+            main_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        except Exception:
+            pass
 
-    # 中部：进度信息
-    info_frame = ttk.LabelFrame(main_paned, text="绘制进度")
-    main_paned.add(info_frame, weight=1)
+    def adjust_scrollbar_visibility():
+        # 检查内部内容高度是否超过可视区域
+        try:
+            bbox = main_canvas.bbox(main_canvas_window)
+            if not bbox:
+                # 没有内容，隐藏滚动条
+                try:
+                    v_scrollbar.pack_forget()
+                except Exception:
+                    pass
+                try:
+                    main_canvas.unbind_all("<MouseWheel>")
+                except Exception:
+                    pass
+                return
+            content_height = bbox[3] - bbox[1]
+            view_height = main_canvas.winfo_height()
+            if content_height <= max(0, view_height - 4):
+                # 内容未超出可视区，隐藏滚动条并解绑滚轮
+                try:
+                    v_scrollbar.pack_forget()
+                except Exception:
+                    pass
+                try:
+                    main_canvas.unbind_all("<MouseWheel>")
+                except Exception:
+                    pass
+            else:
+                # 内容超出，显示滚动条并绑定滚轮
+                try:
+                    # 如果尚未布局，则 pack
+                    if not v_scrollbar.winfo_ismapped():
+                        v_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+                    main_canvas.configure(yscrollcommand=v_scrollbar.set)
+                except Exception:
+                    pass
+                try:
+                    main_canvas.bind_all("<MouseWheel>", on_mousewheel)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    # 顶部：画板预览（自适应大小，支持拖拽和缩放）
+    preview_frame = ttk.LabelFrame(main_frame, text="画板预览 (滚轮缩放 | 拖拽平移)")
+    preview_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    # 预览画布容器
+    preview_container = ttk.Frame(preview_frame)
+    preview_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    
+    # 画布状态
+    canvas_state = {
+        'scale': preview_scale,  # 当前缩放比例
+        'offset_x': 0,           # X方向偏移
+        'offset_y': 0,           # Y方向偏移
+        'dragging': False,
+        'drag_start_x': 0,
+        'drag_start_y': 0,
+        'canvas_width': 400,     # 画布显示宽度
+        'canvas_height': 300     # 画布显示高度
+    }
+    
+    canvas = tk.Canvas(preview_container, bg="#222", highlightthickness=0)
+    canvas.pack(fill=tk.BOTH, expand=True)
+    
+    # 缩放信息标签
+    scale_info_label = ttk.Label(preview_frame, text=f"缩放: {int(preview_scale*100)}%", foreground='gray')
+    scale_info_label.pack(side=tk.BOTTOM, pady=2)
+    
+    # 自适应画布大小
+    def update_canvas_size(event=None):
+        canvas_state['canvas_width'] = canvas.winfo_width()
+        canvas_state['canvas_height'] = canvas.winfo_height()
+        # 初次加载时，自动调整缩放以适应窗口
+        if canvas_state['canvas_width'] > 1 and canvas_state['scale'] == 0.25:
+            # 计算合适的缩放比例
+            scale_w = canvas_state['canvas_width'] / BOARD_W
+            scale_h = canvas_state['canvas_height'] / BOARD_H
+            canvas_state['scale'] = min(scale_w, scale_h, 1.0)
+            scale_info_label.config(text=f"缩放: {int(canvas_state['scale']*100)}%")
+        redraw()
+    
+    canvas.bind('<Configure>', update_canvas_size)
+    
+    # 鼠标拖拽功能
+    def on_canvas_press(event):
+        canvas_state['dragging'] = True
+        canvas_state['drag_start_x'] = event.x
+        canvas_state['drag_start_y'] = event.y
+        canvas.config(cursor='fleur')
+    
+    def on_canvas_drag(event):
+        if canvas_state['dragging']:
+            dx = event.x - canvas_state['drag_start_x']
+            dy = event.y - canvas_state['drag_start_y']
+            canvas_state['offset_x'] += dx
+            canvas_state['offset_y'] += dy
+            canvas_state['drag_start_x'] = event.x
+            canvas_state['drag_start_y'] = event.y
+            constrain_offset()
+            redraw()
+    
+    def on_canvas_release(event):
+        canvas_state['dragging'] = False
+        canvas.config(cursor='')
+    
+    # 鼠标滚轮缩放
+    def on_canvas_wheel(event):
+        # 获取鼠标位置
+        mouse_x = event.x
+        mouse_y = event.y
+        
+        # 计算缩放前鼠标指向的图像坐标
+        old_scale = canvas_state['scale']
+        img_x = (mouse_x - canvas_state['offset_x']) / old_scale
+        img_y = (mouse_y - canvas_state['offset_y']) / old_scale
+        
+        # 调整缩放
+        if event.delta > 0:
+            canvas_state['scale'] *= 1.1
+        else:
+            canvas_state['scale'] /= 1.1
+        
+        # 限制缩放范围
+        canvas_state['scale'] = max(0.1, min(5.0, canvas_state['scale']))
+        
+        # 调整偏移以保持鼠标位置不变
+        canvas_state['offset_x'] = mouse_x - img_x * canvas_state['scale']
+        canvas_state['offset_y'] = mouse_y - img_y * canvas_state['scale']
+        
+        scale_info_label.config(text=f"缩放: {int(canvas_state['scale']*100)}%")
+    
+    
+    canvas.bind('<Button-1>', on_canvas_press)
+    canvas.bind('<B1-Motion>', on_canvas_drag)
+    canvas.bind('<ButtonRelease-1>', on_canvas_release)
+    canvas.bind('<MouseWheel>', on_canvas_wheel)
+
+    # 中部：进度信息（紧凑布局）
+    info_frame = ttk.LabelFrame(main_frame, text="绘制进度")
+    info_frame.pack(fill=tk.X, padx=5, pady=5)
 
     progress_var = tk.DoubleVar(value=0.0)
     style = ttk.Style()
@@ -70,33 +245,39 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
     style.configure('green.Horizontal.TProgressbar', troughcolor='#ddd', background='#4caf50')
     style.configure('red.Horizontal.TProgressbar', troughcolor='#ddd', background='#d32f2f')
     
-    progressbar = ttk.Progressbar(info_frame, orient=tk.HORIZONTAL, length=800, mode='determinate', 
+    progressbar = ttk.Progressbar(info_frame, orient=tk.HORIZONTAL, mode='determinate', 
                                   variable=progress_var, maximum=100.0, style='green.Horizontal.TProgressbar')
-    progressbar.pack(pady=5, padx=10)
+    progressbar.pack(fill=tk.X, pady=3, padx=5)
 
-    lbl_info = ttk.Label(info_frame, text="")
-    lbl_info.pack(pady=5)
+    lbl_info = ttk.Label(info_frame, text="", wraplength=450, justify=tk.LEFT)
+    lbl_info.pack(fill=tk.X, pady=2, padx=5)
 
-    eta_lbl = ttk.Label(info_frame, text='', width=40, anchor='w')
-    eta_lbl.pack(pady=5)
+    # 可用/就绪用户展示
+    users_lbl = ttk.Label(info_frame, text='可用: 0 | 就绪: 0', anchor='w', foreground='blue')
+    users_lbl.pack(fill=tk.X, pady=1, padx=5)
 
-    # 底部：图片管理
-    images_frame = ttk.LabelFrame(main_paned, text="图片管理")
-    main_paned.add(images_frame, weight=2)
+    eta_lbl = ttk.Label(info_frame, text='', anchor='w')
+    eta_lbl.pack(fill=tk.X, pady=2, padx=5)
 
-    # 图片列表表格
+    # 底部：图片管理（可折叠）
+    images_frame = ttk.LabelFrame(main_frame, text="图片管理")
+    images_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    # 图片列表表格（紧凑高度）
     tree_frame = ttk.Frame(images_frame)
     tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-    columns = ('启用', '图片路径', '起点X', '起点Y', '宽度', '高度', '绘图模式', '权重')
-    tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=8)
+    columns = ('启用', '图片路径', '起点X', '起点Y', '宽度', '高度', '模式', '权重')
+    tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=5)
     
     for col in columns:
         tree.heading(col, text=col)
         if col == '图片路径':
-            tree.column(col, width=300)
+            tree.column(col, width=200, minwidth=100)
+        elif col in ('启用', '模式', '权重'):
+            tree.column(col, width=50, minwidth=40)
         else:
-            tree.column(col, width=80)
+            tree.column(col, width=60, minwidth=40)
     
     tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
     
@@ -104,9 +285,9 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
     tree.configure(yscrollcommand=scrollbar.set)
 
-    # 图片操作按钮
+    # 图片操作按钮（紧凑布局）
     btn_frame = ttk.Frame(images_frame)
-    btn_frame.pack(fill=tk.X, padx=5, pady=5)
+    btn_frame.pack(fill=tk.X, padx=5, pady=3)
 
     def refresh_tree():
         """刷新图片列表显示"""
@@ -244,14 +425,14 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
         refresh_tree()
         save_and_offer_restart(config)
 
-    ttk.Button(btn_frame, text="添加图片", command=add_image).pack(side=tk.LEFT, padx=5)
-    ttk.Button(btn_frame, text="编辑图片", command=edit_image).pack(side=tk.LEFT, padx=5)
-    ttk.Button(btn_frame, text="删除图片", command=remove_image).pack(side=tk.LEFT, padx=5)
-    ttk.Button(btn_frame, text="启用/禁用", command=toggle_enabled).pack(side=tk.LEFT, padx=5)
+    ttk.Button(btn_frame, text="➕ 添加", command=add_image, width=8).pack(side=tk.LEFT, padx=2)
+    ttk.Button(btn_frame, text="✏️ 编辑", command=edit_image, width=8).pack(side=tk.LEFT, padx=2)
+    ttk.Button(btn_frame, text="🗑️ 删除", command=remove_image, width=8).pack(side=tk.LEFT, padx=2)
+    ttk.Button(btn_frame, text="⚡ 切换", command=toggle_enabled, width=8).pack(side=tk.LEFT, padx=2)
 
-    # 控制按钮
+    # 控制按钮（放在进度信息区域）
     ctrl_btn_frame = ttk.Frame(info_frame)
-    ctrl_btn_frame.pack(pady=5)
+    ctrl_btn_frame.pack(fill=tk.X, pady=3, padx=5)
 
     overlay_var = tk.BooleanVar(value=False)
 
@@ -262,7 +443,154 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             gui_state['overlay'] = v
         redraw()
 
-    ttk.Button(ctrl_btn_frame, text='预览成果', command=toggle_overlay).pack(side=tk.LEFT, padx=5)
+    ttk.Button(ctrl_btn_frame, text='👁️ 预览成果', command=toggle_overlay).pack(side=tk.LEFT, padx=2)
+    
+    # 拖动设置起点功能
+    def open_drag_window():
+        """打开拖动设置起点窗口"""
+        # 检查是否有图片
+        if not config.get('images'):
+            messagebox.showwarning("提示", "请先添加至少一个图片")
+            return
+        
+        # 让用户选择要调整的图片
+        if len(config['images']) == 1:
+            img_idx = 0
+        else:
+            # 创建选择窗口
+            select_win = tk.Toplevel(root)
+            select_win.title("选择要调整的图片")
+            select_win.geometry("300x200")
+            
+            ttk.Label(select_win, text="请选择要调整起点的图片:").pack(pady=10)
+            
+            listbox = tk.Listbox(select_win)
+            listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+            
+            for idx, img in enumerate(config['images']):
+                listbox.insert(tk.END, f"{idx+1}. {os.path.basename(img.get('image_path', ''))}")
+            
+            listbox.select_set(0)
+            
+            selected_idx = [0]
+            
+            def on_select():
+                if listbox.curselection():
+                    selected_idx[0] = listbox.curselection()[0]
+                    select_win.destroy()
+                else:
+                    messagebox.showwarning("提示", "请选择一个图片")
+            
+            ttk.Button(select_win, text="确定", command=on_select).pack(pady=5)
+            
+            select_win.wait_window()
+            img_idx = selected_idx[0]
+        
+        img_config = config['images'][img_idx]
+        
+        # 创建拖动窗口
+        drag_win = tk.Toplevel(root)
+        drag_win.title(f'拖动设置起点 - {os.path.basename(img_config["image_path"])}')
+        drag_win.geometry(f"{BOARD_W}x{BOARD_H+50}")
+        
+        # 加载该图片
+        try:
+            target_img = Image.open(img_config['image_path']).convert('RGBA')
+            img_w, img_h = target_img.size
+        except Exception as e:
+            messagebox.showerror("错误", f"无法加载图片: {e}")
+            drag_win.destroy()
+            return
+        
+        drag_canvas = tk.Canvas(drag_win, width=BOARD_W, height=BOARD_H, bg="#222")
+        drag_canvas.pack()
+        
+        # 当前起点
+        current_x = img_config.get('start_x', 0)
+        current_y = img_config.get('start_y', 0)
+        
+        drag_state = {
+            'x': current_x,
+            'y': current_y,
+            'dragging': False,
+            'start_mouse_x': 0,
+            'start_mouse_y': 0,
+            'start_img_x': current_x,
+            'start_img_y': current_y
+        }
+        
+        tk_img_holder = {'img': None}
+        
+        def redraw_drag():
+            # 获取底图
+            base = get_base_image()
+            display_img = base.copy()
+            
+            # 贴上目标图片
+            try:
+                display_img.paste(target_img, (drag_state['x'], drag_state['y']), 
+                                mask=target_img.split()[3] if target_img.mode == 'RGBA' else None)
+            except Exception:
+                pass
+            
+            # 画红框
+            from PIL import ImageDraw
+            draw = ImageDraw.Draw(display_img)
+            x0, y0 = drag_state['x'], drag_state['y']
+            x1, y1 = x0 + img_w, y0 + img_h
+            draw.rectangle([x0, y0, x1-1, y1-1], outline='red', width=2)
+            
+            # 显示坐标
+            draw.text((x0+5, y0+5), f"({drag_state['x']}, {drag_state['y']})", fill='yellow')
+            
+            tk_img = ImageTk.PhotoImage(display_img)
+            tk_img_holder['img'] = tk_img
+            drag_canvas.delete("all")
+            drag_canvas.create_image(0, 0, anchor='nw', image=tk_img)
+        
+        def on_drag_press(event):
+            # 检查是否点击在图片范围内
+            if (drag_state['x'] <= event.x <= drag_state['x'] + img_w and
+                drag_state['y'] <= event.y <= drag_state['y'] + img_h):
+                drag_state['dragging'] = True
+                drag_state['start_mouse_x'] = event.x
+                drag_state['start_mouse_y'] = event.y
+                drag_state['start_img_x'] = drag_state['x']
+                drag_state['start_img_y'] = drag_state['y']
+                drag_canvas.config(cursor='fleur')
+        
+        def on_drag_motion(event):
+            if drag_state['dragging']:
+                dx = event.x - drag_state['start_mouse_x']
+                dy = event.y - drag_state['start_mouse_y']
+                new_x = max(0, min(BOARD_W - img_w, drag_state['start_img_x'] + dx))
+                new_y = max(0, min(BOARD_H - img_h, drag_state['start_img_y'] + dy))
+                drag_state['x'] = new_x
+                drag_state['y'] = new_y
+                redraw_drag()
+        
+        def on_drag_release(event):
+            drag_state['dragging'] = False
+            drag_canvas.config(cursor='')
+        
+        def apply_position():
+            img_config['start_x'] = drag_state['x']
+            img_config['start_y'] = drag_state['y']
+            save_and_offer_restart(config)
+            drag_win.destroy()
+        
+        drag_canvas.bind('<Button-1>', on_drag_press)
+        drag_canvas.bind('<B1-Motion>', on_drag_motion)
+        drag_canvas.bind('<ButtonRelease-1>', on_drag_release)
+        
+        btn_frame = ttk.Frame(drag_win)
+        btn_frame.pack(pady=5)
+        ttk.Button(btn_frame, text='✓ 应用', command=apply_position).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text='✗ 取消', command=drag_win.destroy).pack(side=tk.LEFT, padx=5)
+        
+        redraw_drag()
+    
+    ttk.Button(ctrl_btn_frame, text='🎯 拖动设置起点', command=open_drag_window).pack(side=tk.LEFT, padx=2)
 
     # 缓存的底图与时间戳
     cached = {
@@ -338,9 +666,43 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             x1, y1 = x0 + img_data['width'], y0 + img_data['height']
             draw.rectangle([x0, y0, x1-1, y1-1], outline='red', width=2)
 
+        # 根据当前缩放和偏移进行变换
+        scale = canvas_state['scale']
+        if scale != 1.0:
+            new_w = int(BOARD_W * scale)
+            new_h = int(BOARD_H * scale)
+            img = img.resize((new_w, new_h), Image.Resampling.NEAREST)
+        
         tk_img = ImageTk.PhotoImage(img)
         cached['tk_img'] = tk_img
-        canvas.create_image(0, 0, anchor='nw', image=tk_img)
+        canvas.delete("all")
+        canvas.create_image(canvas_state['offset_x'], canvas_state['offset_y'], anchor='nw', image=tk_img)
+
+    def constrain_offset():
+        """限制偏移量，保证图像不会被无限拖出可视区域。"""
+        try:
+            scale = canvas_state['scale']
+            disp_w = int(BOARD_W * scale)
+            disp_h = int(BOARD_H * scale)
+            vw = max(1, canvas_state.get('canvas_width', canvas.winfo_width()))
+            vh = max(1, canvas_state.get('canvas_height', canvas.winfo_height()))
+
+            # 最小和最大偏移
+            min_x = min(0, vw - disp_w)
+            max_x = 0
+            min_y = min(0, vh - disp_h)
+            max_y = 0
+
+            if canvas_state['offset_x'] < min_x:
+                canvas_state['offset_x'] = min_x
+            if canvas_state['offset_x'] > max_x:
+                canvas_state['offset_x'] = max_x
+            if canvas_state['offset_y'] < min_y:
+                canvas_state['offset_y'] = min_y
+            if canvas_state['offset_y'] > max_y:
+                canvas_state['offset_y'] = max_y
+        except Exception:
+            pass
 
     # 进度更新
     from collections import deque
@@ -355,7 +717,7 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             ready = int(gui_state.get('ready_count', 0))
             resistance_pct = gui_state.get('resistance_pct', None)
             num_images = len(gui_state.get('images_data', []))
-        
+
         pct = 100.0 if total <= 0 else max(0.0, min(100.0, (total - mismatched) * 100.0 / max(1, total)))
         progress_var.set(pct)
 
@@ -365,17 +727,17 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             gui_history.append((now, pct))
             while gui_history and (now - gui_history[0][0] > window_seconds):
                 gui_history.popleft()
-            
+
             growth = None
             growth_str = ''
             eta_str = ''
-            
+
             if len(gui_history) >= 2:
                 t0, p0 = gui_history[0]
                 t1, p1 = gui_history[-1]
                 dt = max(1e-6, t1 - t0)
                 growth = (p1 - p0) / dt
-            
+
             if growth is None:
                 growth_str = '增长: --'
             else:
@@ -405,7 +767,7 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
                 danger = True
         except Exception:
             pass
-        
+
         try:
             if danger:
                 progressbar.configure(style='red.Horizontal.TProgressbar')
@@ -418,9 +780,15 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
         if resistance_pct is not None:
             res_str = f'  抵抗率: {resistance_pct:5.1f}%'
 
-        lbl_info.config(text=f"进度: {pct:6.2f}%  总像素: {total}  未达标: {mismatched}  "
-                            f"可用用户: {available} (就绪:{ready})  图片数: {num_images}{res_str}  {growth_str}")
+        # 使用紧凑的多行显示
+        info_text = f"进度: {pct:6.2f}% | 总: {total} | 未达标: {mismatched}\n"
+        info_text += f"用户: {available} (就绪:{ready}) | 图片: {num_images}{res_str}\n{growth_str}"
+        lbl_info.config(text=info_text)
         eta_lbl.config(text=eta_str)
+        try:
+            users_lbl.config(text=f"可用: {available} | 就绪: {ready}")
+        except Exception:
+            pass
 
     def tick():
         update_status()
