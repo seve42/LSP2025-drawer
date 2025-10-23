@@ -10,13 +10,13 @@ import random
 import sys
 from uuid import UUID
 from PIL import Image
+import threading
 
 # --- 全局配置 ---
 API_BASE_URL = "https://paintboard.luogu.me"
 WS_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 CONFIG_FILE = "config.json"
 
-# --- 日志配置 ---
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -26,125 +26,18 @@ logging.basicConfig(
     ]
 )
 
-# --- 绘画队列 ---
+# 发送粘包所用的全局队列
 paint_queue = []
 total_size = 0
 
-def load_config():
-    """从 config.json 加载配置"""
+def save_config(config: dict):
+    """保存配置到本地 config.json"""
     try:
-        with open(CONFIG_FILE, 'r') as f:
-            config = json.load(f)
-        logging.getLogger().setLevel(config.get("log_level", "INFO").upper())
-        logging.info("配置加载成功。")
-        return config
-    except FileNotFoundError:
-        logging.error(f"错误：找不到配置文件 {CONFIG_FILE}。")
-        return None
-    except json.JSONDecodeError:
-        logging.error(f"错误：配置文件 {CONFIG_FILE} 格式无效。")
-        return None
-
-def get_token(uid, access_key):
-    """使用 UID 和 Access Key 获取 Token。
-
-    兼容多种响应格式，并禁用环境代理（避免受 HTTP(S)_PROXY 干扰）。
-    在失败时记录响应内容以便调试。
-    """
-    url = f"{API_BASE_URL}/api/auth/gettoken"
-    payload = {"uid": uid, "access_key": access_key}
-    try:
-        # 使用 Session 并禁用环境代理（trust_env=False），避免受系统代理影响
-        session = requests.Session()
-        session.trust_env = False
-        response = session.post(url, json=payload, timeout=10)
-        response.raise_for_status()
-
-        try:
-            data = response.json()
-        except ValueError:
-            logging.error(f"获取 UID {uid} 的 Token 失败：响应不是 JSON，status={response.status_code}")
-            logging.debug(f"响应文本: {response.text}")
-            return None
-
-        # 支持多种可能的响应结构：
-        # 1) { "token": "..." }
-        # 2) { "data": { "token": "..." } }
-        # 3) { "status": 200, "data": { "token": "..." } }
-        if isinstance(data, dict):
-            if data.get("token"):
-                logging.info(f"成功获取 UID {uid} 的 Token。")
-                return data["token"]
-            if isinstance(data.get("data"), dict) and data["data"].get("token"):
-                logging.info(f"成功获取 UID {uid} 的 Token。")
-                return data["data"]["token"]
-            if data.get("status") == 200 and isinstance(data.get("data"), dict) and data["data"].get("token"):
-                logging.info(f"成功获取 UID {uid} 的 Token。")
-                return data["data"]["token"]
-
-            # 无 token，尝试读取 errorType
-            error_type = data.get("errorType") or (data.get("data") or {}).get("errorType")
-            logging.error(f"获取 UID {uid} 的 Token 失败: {error_type or '未知错误'}")
-            logging.debug(f"Token 接口返回内容: {data}")
-            return None
-        else:
-            logging.error(f"获取 UID {uid} 的 Token 失败：响应格式未知（{type(data)}）。")
-            logging.debug(f"Token 接口返回内容: {data}")
-            return None
-    except requests.RequestException as e:
-        logging.error(f"请求 Token 时发生网络错误: {e}")
-        return None
-
-def load_image_pixels(config):
-    """加载图像并返回像素数据"""
-    image_path = config.get("image_path")
-    if not image_path:
-        logging.error("配置文件中未指定 image_path。")
-        return None, 0, 0
-    
-    try:
-        # 使用 RGBA 加载以便检测透明通道
-        with Image.open(image_path) as img:
-            img = img.convert("RGBA")
-            width, height = img.size
-            raw_pixels = list(img.getdata())
-            # raw_pixels 中每个元素为 (r, g, b, a)
-            logging.info(f"成功加载图像 '{image_path}'，尺寸: {width}x{height}。")
-            return raw_pixels, width, height
-    except FileNotFoundError:
-        logging.error(f"找不到图像文件: {image_path}")
-        return None, 0, 0
-    except Exception as e:
-        logging.error(f"加载图像时出错: {e}")
-        return None, 0, 0
-
-def get_draw_order(mode, width, height, board_width=1000, board_height=600):
-    """根据模式生成绘画坐标序列"""
-    coords = []
-    if mode == "horizontal":
-        for y in range(height):
-            for x in range(width):
-                coords.append((x, y))
-    elif mode == "concentric":
-        left, top, right, bottom = 0, 0, width - 1, height - 1
-        while left <= right and top <= bottom:
-            for x in range(left, right + 1): coords.append((x, top))
-            top += 1
-            if top > bottom: break
-            for y in range(top, bottom + 1): coords.append((right, y))
-            right -= 1
-            if left > right: break
-            for x in range(right, left - 1, -1): coords.append((x, bottom))
-            bottom -= 1
-            if top > bottom: break
-            for y in range(bottom, top - 1, -1): coords.append((left, y))
-            left += 1
-    else: # random
-        coords = [(x, y) for y in range(height) for x in range(width)]
-        random.shuffle(coords)
-    
-    logging.info(f"使用 '{mode}' 模式生成 {len(coords)} 个绘画坐标。")
-    return coords
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(config, f, ensure_ascii=False, indent=4)
+        logging.info("配置已保存到 config.json")
+    except Exception:
+        logging.exception("保存配置失败")
 
 def append_to_queue(paint_data):
     """将绘画数据添加到粘包队列"""
@@ -279,7 +172,116 @@ def fetch_board_snapshot():
         return {}
 
 
-async def handle_websocket(config, users_with_tokens, pixels, width, height, debug=False):
+def get_draw_order(mode: str, width: int, height: int):
+    """根据模式返回绘制顺序坐标列表（相对坐标）。
+
+    支持模式：
+    - horizontal: 从上到下、从左到右
+    - concentric: 以图像中心为基准，按 Chebyshev 距离从小到大（近似同心扩散）
+    - random: 随机顺序（使用固定种子确保可重现）
+    """
+    coords = [(x, y) for y in range(height) for x in range(width)]
+    m = (mode or '').lower()
+    if m == 'horizontal':
+        return coords
+    if m == 'concentric':
+        cx = (width - 1) / 2.0
+        cy = (height - 1) / 2.0
+        return sorted(coords, key=lambda p: max(abs(p[0]-cx), abs(p[1]-cy)))
+    if m == 'random':
+        rnd = random.Random(width * 10007 + height * 97)
+        rnd.shuffle(coords)
+        return coords
+    # 默认
+    return coords
+
+
+def load_config():
+    """加载配置文件，返回 dict；若失败则记录错误并返回 None。"""
+    try:
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            cfg = json.load(f)
+        # 填充默认值
+        cfg.setdefault('paint_interval_ms', 20)
+        cfg.setdefault('round_interval_seconds', 30)
+        cfg.setdefault('user_cooldown_seconds', 30)
+        cfg.setdefault('draw_mode', 'random')
+        cfg.setdefault('image_path', 'image.png')
+        cfg.setdefault('start_x', 0)
+        cfg.setdefault('start_y', 0)
+        cfg.setdefault('users', [])
+        return cfg
+    except FileNotFoundError:
+        logging.error("找不到 config.json")
+        return None
+    except Exception:
+        logging.exception("加载配置失败")
+        return None
+
+
+def load_image_pixels(config):
+    """根据配置加载目标图片，返回 (pixels,width,height)
+
+    pixels 为 RGBA 四元组列表。
+    """
+    image_path = config.get('image_path')
+    if not image_path or not os.path.exists(image_path):
+        logging.error(f"找不到目标图片: {image_path}")
+        return None, 0, 0
+    try:
+        img = Image.open(image_path).convert('RGBA')
+        width, height = img.size
+        pixels = list(img.getdata())
+        logging.info(f"已加载目标图片: {image_path} 大小: {width}x{height}")
+        return pixels, width, height
+    except Exception:
+        logging.exception("加载目标图片失败")
+        return None, 0, 0
+
+
+def get_token(uid: int, access_key: str):
+    """从服务端获取绘制 token。返回 token 字符串或 None。"""
+    try:
+        session = requests.Session()
+        session.trust_env = False
+        # 2025-10-14 文档与仓库说明：获取 Token 的接口为 POST /api/auth/gettoken
+        url = f"{API_BASE_URL}/api/auth/gettoken"
+        try:
+            resp = session.post(url, json={'uid': uid, 'access_key': access_key}, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.HTTPError as e:
+            logging.warning(f"获取 token 失败 uid={uid}: {e}")
+            return None
+        except Exception as e:
+            logging.warning(f"获取 token 时发生异常 uid={uid}: {e}")
+            return None
+
+        # 解析多种可能的响应包装，优先寻找 token 字段
+        # 常见结构：{ "data": { "token": "..." }, "code":0 }
+        token = None
+        if isinstance(data, dict):
+            # 直接 token
+            token = data.get('token')
+            if not token:
+                # data 里可能嵌套
+                inner = data.get('data') or data.get('result')
+                if isinstance(inner, dict):
+                    token = inner.get('token') or inner.get('paintToken')
+            # 兼容旧字段
+            if not token:
+                token = data.get('paintToken')
+
+        if not token:
+            logging.warning(f"未从接口获取到 token，响应: {data}")
+            return None
+        return token
+    except Exception as e:
+        logging.warning(f"获取 token 失败 uid={uid}: {e}")
+        return None
+
+
+async def handle_websocket(config, users_with_tokens, pixels, width, height, debug=False, gui_state=None):
     """主 WebSocket 处理函数
 
     修复点：
@@ -295,9 +297,24 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
 
     # 目标像素映射（绝对坐标 -> 目标 RGB）
     target_map = build_target_map(pixels, width, height, start_x, start_y)
-    target_positions = list(target_map.keys())
-    if draw_mode == "random":
-        random.shuffle(target_positions)
+    
+    # 根据模式生成有序的绘画坐标
+    ordered_coords = get_draw_order(draw_mode, width, height)
+    # 转换为绝对坐标
+    target_positions = [(start_x + x, start_y + y) for x, y in ordered_coords if (start_x + x, start_y + y) in target_map]
+    current_draw_mode = draw_mode
+    current_start_x, current_start_y = start_x, start_y
+
+    # 如果有 GUI 状态对象，初始化一些可视化字段
+    if gui_state is not None:
+        with gui_state['lock']:
+            gui_state['total'] = len(target_positions)
+            gui_state['mismatched'] = len(target_positions)
+            gui_state['available'] = len(users_with_tokens)
+            gui_state['ready_count'] = len(users_with_tokens)
+            gui_state['target_bbox'] = (start_x, start_y, width, height)
+            gui_state['stop'] = False
+
 
     # 临时移除环境中的代理变量，避免 websockets 库自动通过 HTTP_PROXY/HTTPS_PROXY 走代理
     proxy_keys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
@@ -320,10 +337,12 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
             try:
                 snapshot = fetch_board_snapshot()
                 if snapshot:
-                    # 只保留与目标区域相关的坐标，避免存储整个 1000x600
-                    for pos in target_positions:
-                        if pos in snapshot:
-                            board_state[pos] = snapshot[pos]
+                    # 使用完整快照，便于 GUI 显示整个画板
+                    board_state = snapshot.copy()
+                    # 若有 GUI，初始化 GUI 的 board_state（全板快照）
+                    if gui_state is not None:
+                        with gui_state['lock']:
+                            gui_state['board_state'] = board_state.copy()
             except Exception:
                 logging.debug("初始化画板快照时出现异常，继续使用空的 board_state。")
             # 画板状态改变事件（用于唤醒调度器进行即时修复）
@@ -363,6 +382,13 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                                     # 若更新触及目标区域，唤醒调度器以便即时修复
                                     if (x, y) in target_map:
                                         state_changed_event.set()
+                                    # 同步到 GUI（实时画板预览）
+                                    if gui_state is not None:
+                                        try:
+                                            with gui_state['lock']:
+                                                gui_state['board_state'][(x, y)] = (r, g, b)
+                                        except Exception:
+                                            pass
                                 except Exception:
                                     # 出错则跳过此条
                                     pass
@@ -380,25 +406,42 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
 
             # 启动进度显示器（每秒刷新）
             async def progress_printer():
-                total = len(target_positions)
+                # 模式前缀，例如: [模式:horizontal] 
+                mode_prefix = f"[模式:{draw_mode}] "
                 while True:
                     # 计算完成度（不符合的像素数会降低完成度）
+                    total = len(target_positions)
                     mismatched = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
                     completed = max(0, total - mismatched)
                     pct = (completed / total * 100) if total > 0 else 100.0
                     # 可用用户数
                     now = time.monotonic()
-                    available = len([u for u in users_with_tokens if cooldown_until.get(u['uid'], 0.0) <= now])
+                    # 逻辑修正：冷却中的用户仍应被视为“可用”（他们拥有有效 token 并未因绘制失败失效）
+                    # 因此这里把可用计数设为所有已获取 token 的用户数，同时计算就绪（未冷却）用户数用于分配显示
+                    available = len(users_with_tokens)
+                    ready_count = len([u for u in users_with_tokens if cooldown_until.get(u['uid'], 0.0) <= now])
                     bar_len = 40
                     filled = int(bar_len * completed / total) if total > 0 else bar_len
                     bar = '#' * filled + '-' * (bar_len - filled)
-                    line = f"进度: [{bar}] {pct:6.2f}% 可用用户: {available}  未达标: {mismatched}"
+                    # 显示格式：在进度条左侧加入模式前缀
+                    line = f"{mode_prefix}进度: [{bar}] {pct:6.2f}% 可用用户: {available} (就绪:{ready_count})  未达标: {mismatched}"
                     if debug:
                         logging.info(line)
                     else:
                         # 非 debug 模式：只在控制台打印进度条（刷新）
                         sys.stdout.write('\r' + line)
                         sys.stdout.flush()
+                    # 更新 GUI 状态
+                    if gui_state is not None:
+                        with gui_state['lock']:
+                            gui_state['total'] = total
+                            gui_state['mismatched'] = mismatched
+                            gui_state['available'] = len(users_with_tokens)
+                            gui_state['ready_count'] = ready_count
+                    # 若 GUI 请求停止则退出循环
+                    if gui_state is not None and gui_state.get('stop'):
+                        logging.info('收到 GUI 退出信号，结束调度循环。')
+                        return
                     await asyncio.sleep(1)
 
             # 调度：支持冷却与持续监视
@@ -411,6 +454,37 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
             progress_task = asyncio.create_task(progress_printer())
 
             while True:
+                # 检查 GUI 是否修改了绘制模式
+                if gui_state is not None:
+                    with gui_state['lock']:
+                        new_mode = gui_state.get('draw_mode', current_draw_mode)
+                        new_start_x = gui_state.get('start_x', current_start_x)
+                        new_start_y = gui_state.get('start_y', current_start_y)
+                else:
+                    new_mode = current_draw_mode
+                    new_start_x, new_start_y = current_start_x, current_start_y
+                if new_mode != current_draw_mode:
+                    logging.info(f"检测到模式切换: {current_draw_mode} -> {new_mode}，重新生成绘制顺序。")
+                    current_draw_mode = new_mode
+                    ordered_coords = get_draw_order(current_draw_mode, width, height)
+                    target_positions = [(current_start_x + x, current_start_y + y) for x, y in ordered_coords if (current_start_x + x, current_start_y + y) in target_map]
+                    if gui_state is not None:
+                        with gui_state['lock']:
+                            gui_state['total'] = len(target_positions)
+                # 检查起点坐标变化
+                if (new_start_x, new_start_y) != (current_start_x, current_start_y):
+                    logging.info(f"检测到起点变化: ({current_start_x},{current_start_y}) -> ({new_start_x},{new_start_y})，重建目标映射与绘制顺序。")
+                    current_start_x, current_start_y = new_start_x, new_start_y
+                    target_map = build_target_map(pixels, width, height, current_start_x, current_start_y)
+                    ordered_coords = get_draw_order(current_draw_mode, width, height)
+                    target_positions = [(current_start_x + x, current_start_y + y) for x, y in ordered_coords if (current_start_x + x, current_start_y + y) in target_map]
+                    if gui_state is not None:
+                        with gui_state['lock']:
+                            gui_state['total'] = len(target_positions)
+                # 若 GUI 模式要求停止，退出循环
+                if gui_state is not None and gui_state.get('stop'):
+                    logging.info('收到 GUI 退出信号，结束主循环。')
+                    break
                 now = time.monotonic()
                 # 未达目标色（未知状态也视为未完成）
                 remaining = [pos for pos in target_positions if board_state.get(pos) != target_map[pos]]
@@ -420,12 +494,11 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
 
                 assigned = 0
                 if remaining and available_users:
-                    random.shuffle(remaining)
                     # 立即为可用用户分配修复任务（每人 1 个）
                     for user in available_users:
                         if not remaining:
                             break
-                        x, y = remaining.pop()
+                        x, y = remaining.pop(0) # 从列表头部取点，以遵循原始顺序
                         r, g, b = target_map[(x, y)]
                         uid = user['uid']
                         token = user['token']
@@ -504,11 +577,13 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
 
 def main():
     """主函数"""
-    # 解析命令行参数（支持 -debug）
+    # 解析命令行参数（支持 -debug 和 -cli）
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('-debug', action='store_true', help='启用详细日志（DEBUG）并显示完整日志）')
+    parser.add_argument('-cli', action='store_true', help='仅命令行模式，禁用 GUI')
     args, _ = parser.parse_known_args()
     debug = bool(args.debug)
+    cli_only = bool(args.cli)
 
     config = load_config()
     if not config:
@@ -518,13 +593,60 @@ def main():
     if not pixels:
         return
 
-    users_with_tokens = []
-    for user in config.get("users", []):
-        token = get_token(user["uid"], user["access_key"])
-        if token:
-            users_with_tokens.append({"uid": user["uid"], "token": token})
+    # 获取 token 阶段：在 GUI 模式下显示进度条避免无响应感
+    def get_tokens_with_progress(users_list, allow_gui=True):
+        results = []
+        total = len(users_list)
+        # 尝试在主线程创建一个临时 Tk 窗口（仅用于进度显示）
+        use_tk = False
+        progress = None
+        root = None
+        try:
+            if not cli_only and allow_gui:
+                import tkinter as tk
+                from tkinter import ttk
+                root = tk.Tk()
+                root.title('获取 Token 中...')
+                root.geometry('400x80')
+                ttk.Label(root, text='正在获取用户 Token，请稍候...').pack(pady=(8,0))
+                progress = ttk.Progressbar(root, orient='horizontal', length=360, mode='determinate', maximum=total)
+                progress.pack(pady=(6,8))
+                root.update()
+                use_tk = True
+        except Exception:
+            # 无法创建 GUI，回退到控制台
+            use_tk = False
+
+        idx = 0
+        for user in users_list:
+            uid = user.get('uid')
+            ak = user.get('access_key')
+            token = get_token(uid, ak)
+            if token:
+                results.append({'uid': uid, 'token': token})
+            else:
+                logging.warning(f"无法为 UID {uid} 获取 Token，将跳过此用户。")
+            idx += 1
+            if use_tk and progress is not None:
+                try:
+                    progress['value'] = idx
+                    root.update()
+                except Exception:
+                    pass
+            else:
+                sys.stdout.write(f'获取 token 进度: {idx}/{total}\r')
+                sys.stdout.flush()
+
+        if use_tk and root is not None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
         else:
-            logging.warning(f"无法为 UID {user['uid']} 获取 Token，将跳过此用户。")
+            print('')
+        return results
+
+    users_with_tokens = get_tokens_with_progress(config.get('users', []), allow_gui=True)
     
     if not users_with_tokens:
         logging.error("没有可用的用户 Token，程序退出。")
@@ -541,7 +663,49 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     try:
-        asyncio.run(handle_websocket(config, users_with_tokens, pixels, width, height, debug))
+        gui_available = False
+        start_gui_func = None
+        if not cli_only:
+            try:
+                # 动态导入 GUI 前端
+                from gui import start_gui as start_gui_func
+                gui_available = True
+            except Exception as e:
+                logging.warning(f"GUI 不可用，回退到 CLI：{e}")
+
+        if cli_only or not gui_available:
+            # 保持原有 CLI 行为
+            asyncio.run(handle_websocket(config, users_with_tokens, pixels, width, height, debug))
+        else:
+            # GUI 模式：创建线程安全的 gui_state 并在后台运行 asyncio
+            gui_state = {
+                'lock': threading.RLock(),
+                'stop': False,
+                'board_state': {},
+                'overlay': False,
+                'draw_mode': config.get('draw_mode', 'random'),
+                'start_x': int(config.get('start_x', 0)),
+                'start_y': int(config.get('start_y', 0)),
+            }
+
+            def run_asyncio_loop():
+                try:
+                    asyncio.run(handle_websocket(config, users_with_tokens, pixels, width, height, debug, gui_state=gui_state))
+                except Exception:
+                    logging.exception('后台 asyncio 任务异常')
+
+            t = threading.Thread(target=run_asyncio_loop, daemon=True)
+            t.start()
+
+            # 启动 Tkinter GUI（主线程）
+            try:
+                start_gui_func(config, pixels, width, height, users_with_tokens, gui_state)
+            finally:
+                # GUI 关闭时请求后台停止
+                with gui_state['lock']:
+                    gui_state['stop'] = True
+                t.join(timeout=5)
+                logging.info('GUI 退出，后台任务已请求停止。')
     except KeyboardInterrupt:
         logging.info("检测到手动中断，程序退出。")
     except Exception:
