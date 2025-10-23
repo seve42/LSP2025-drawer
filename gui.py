@@ -261,14 +261,18 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
 
     # 底部：图片管理（可折叠）
     images_frame = ttk.LabelFrame(main_frame, text="图片管理")
-    images_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    # 不让图片管理区域随容器垂直扩展（保持紧凑高度），
+    # 这样当窗口变高时，预览区域会优先获得额外高度并自适应增长。
+    images_frame.pack(fill=tk.X, expand=False, padx=5, pady=5)
 
     # 图片列表表格（紧凑高度）
     tree_frame = ttk.Frame(images_frame)
-    tree_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    # 限制图片列表在垂直方向的初始占用，避免其随着窗口增长占据大量高度
+    tree_frame.pack(fill=tk.X, expand=False, padx=5, pady=5)
 
-    columns = ('启用', '图片路径', '起点X', '起点Y', '宽度', '高度', '模式', '权重')
-    tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=5)
+    columns = ('启用', '图片路径', '起点X', '起点Y', '宽度', '高度', '模式', '权重', '派发')
+    # 将高度设置为较小的行数（例如4），并允许水平扩展但垂直保持紧凑
+    tree = ttk.Treeview(tree_frame, columns=columns, show='headings', height=4)
     
     for col in columns:
         tree.heading(col, text=col)
@@ -293,17 +297,34 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
         """刷新图片列表显示"""
         tree.delete(*tree.get_children())
         images_config = config.get('images', [])
+        # 从 gui_state 获取每张图片的被派发计数（如果后台提供）
+        assigned_map = {}
+        try:
+            with gui_state['lock']:
+                assigned_map = dict(gui_state.get('assigned_per_image', {}) or {})
+        except Exception:
+            assigned_map = {}
+
         for idx, img_cfg in enumerate(images_config):
             enabled = '✓' if img_cfg.get('enabled', True) else '✗'
+            assigned_count = assigned_map.get(idx, 0)
+            # 友好显示：攻击图片使用自定义名称
+            if str(img_cfg.get('type', '')).lower() == 'attack':
+                kind = (img_cfg.get('attack_kind') or 'white')
+                kind_cn = {'white': '白点', 'green': '亮绿色点', 'random': '随机色点'}.get(kind, kind)
+                name = f"[攻击] {kind_cn} {img_cfg.get('width','?')}x{img_cfg.get('height','?')}"
+            else:
+                name = img_cfg.get('image_path', '')
             tree.insert('', 'end', iid=str(idx), values=(
                 enabled,
-                img_cfg.get('image_path', ''),
+                name,
                 img_cfg.get('start_x', 0),
                 img_cfg.get('start_y', 0),
                 img_cfg.get('width', 'N/A'),  # 实际会从图片文件读取
                 img_cfg.get('height', 'N/A'),
                 img_cfg.get('draw_mode', 'random'),
-                img_cfg.get('weight', 1.0)
+                img_cfg.get('weight', 1.0),
+                assigned_count
             ))
 
     def add_image():
@@ -338,6 +359,59 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             except Exception as e:
                 messagebox.showerror("错误", f"无法加载图片: {e}")
 
+    def add_attack():
+        """添加“攻击”图片（随机点阵）。"""
+        win = tk.Toplevel(root)
+        win.title("添加攻击")
+        win.geometry("320x260")
+
+        ttk.Label(win, text="类型:").grid(row=0, column=0, sticky='e', padx=6, pady=6)
+        kind_var = tk.StringVar(value='white')
+        kind_combo = ttk.Combobox(win, textvariable=kind_var, state='readonly',
+                                   values=['white', 'green', 'random'], width=18)
+        kind_combo.grid(row=0, column=1, padx=6, pady=6)
+
+        ttk.Label(win, text="宽度:").grid(row=1, column=0, sticky='e', padx=6, pady=6)
+        w_var = tk.IntVar(value=50)
+        ttk.Spinbox(win, from_=1, to=1000, textvariable=w_var, width=20).grid(row=1, column=1, padx=6, pady=6)
+
+        ttk.Label(win, text="高度:").grid(row=2, column=0, sticky='e', padx=6, pady=6)
+        h_var = tk.IntVar(value=50)
+        ttk.Spinbox(win, from_=1, to=600, textvariable=h_var, width=20).grid(row=2, column=1, padx=6, pady=6)
+
+        ttk.Label(win, text="绘图模式:").grid(row=3, column=0, sticky='e', padx=6, pady=6)
+        mode_var = tk.StringVar(value='random')
+        ttk.Combobox(win, textvariable=mode_var, values=['horizontal', 'concentric', 'random'], state='readonly', width=18).grid(row=3, column=1, padx=6, pady=6)
+
+        ttk.Label(win, text="权重:").grid(row=4, column=0, sticky='e', padx=6, pady=6)
+        weight_var = tk.DoubleVar(value=1.0)
+        ttk.Spinbox(win, from_=0.1, to=10.0, increment=0.1, textvariable=weight_var, width=20).grid(row=4, column=1, padx=6, pady=6)
+
+        def on_ok():
+            W = int(max(1, min(1000, w_var.get())))
+            H = int(max(1, min(600, h_var.get())))
+            kind = kind_var.get()
+            new_item = {
+                'type': 'attack',
+                'attack_kind': kind,
+                'start_x': 0,
+                'start_y': 0,
+                'draw_mode': mode_var.get(),
+                'weight': float(weight_var.get()),
+                'enabled': True,
+                'width': W,
+                'height': H
+            }
+            config.setdefault('images', []).append(new_item)
+            refresh_tree()
+            save_and_offer_restart(config)
+            win.destroy()
+
+        btns = ttk.Frame(win)
+        btns.grid(row=5, column=0, columnspan=2, pady=10)
+        ttk.Button(btns, text="确定", command=on_ok).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btns, text="取消", command=win.destroy).pack(side=tk.LEFT, padx=6)
+
     def remove_image():
         """删除选中的图片"""
         selection = tree.selection()
@@ -366,11 +440,19 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
         
         # 创建编辑窗口
         edit_win = tk.Toplevel(root)
-        edit_win.title(f"编辑图片 - {os.path.basename(img_cfg['image_path'])}")
+        # 标题兼容攻击类型
+        if str(img_cfg.get('type', '')).lower() == 'attack':
+            _kind = (img_cfg.get('attack_kind') or 'white')
+            _kind_cn = {'white': '白点', 'green': '亮绿色点', 'random': '随机色点'}.get(_kind, _kind)
+            _title_name = f"[攻击] {_kind_cn} {img_cfg.get('width','?')}x{img_cfg.get('height','?')}"
+        else:
+            _title_name = os.path.basename(img_cfg.get('image_path',''))
+        edit_win.title(f"编辑图片 - {_title_name}")
         edit_win.geometry("400x350")
         
         ttk.Label(edit_win, text="图片路径:").grid(row=0, column=0, sticky='e', padx=5, pady=5)
-        path_var = tk.StringVar(value=img_cfg.get('image_path', ''))
+        _path_display = _title_name if str(img_cfg.get('type','')).lower() == 'attack' else img_cfg.get('image_path','')
+        path_var = tk.StringVar(value=_path_display)
         ttk.Entry(edit_win, textvariable=path_var, width=30, state='readonly').grid(row=0, column=1, padx=5, pady=5)
         
         ttk.Label(edit_win, text="起点 X:").grid(row=1, column=0, sticky='e', padx=5, pady=5)
@@ -412,23 +494,104 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
         ttk.Button(edit_win, text="保存", command=save_changes).grid(row=7, column=0, columnspan=2, pady=10)
 
     def toggle_enabled():
-        """切换选中图片的启用状态"""
+        """切换选中图片的启用状态并立即通知后台/刷新图片数据。"""
         selection = tree.selection()
         if not selection:
             messagebox.showwarning("提示", "请先选择要切换的图片")
             return
-        
+
         for item in selection:
             idx = int(item)
             config['images'][idx]['enabled'] = not config['images'][idx].get('enabled', True)
-        
+
         refresh_tree()
-        save_and_offer_restart(config)
+
+        # Persist config locally (best-effort)
+        try:
+            save_config(config)
+        except Exception:
+            pass
+
+        # Try to reload images and notify backend/main loop via gui_state
+        def _reload_worker():
+            try:
+                import tool as _tool
+                new_images = _tool.load_all_images(config)
+                if new_images:
+                    try:
+                        with gui_state['lock']:
+                            gui_state['images_data'] = new_images
+                            gui_state['reload_pixels'] = True
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+        try:
+            t = threading.Thread(target=_reload_worker, daemon=True)
+            t.start()
+        except Exception:
+            try:
+                _reload_worker()
+            except Exception:
+                pass
+
+        # Also keep backward-compatibility: call REFRESH_CALLBACK if provided
+        try:
+            if REFRESH_CALLBACK is not None:
+                REFRESH_CALLBACK(config)
+        except Exception:
+            pass
 
     ttk.Button(btn_frame, text="➕ 添加", command=add_image, width=8).pack(side=tk.LEFT, padx=2)
+    ttk.Button(btn_frame, text="🧨 添加攻击", command=add_attack, width=10).pack(side=tk.LEFT, padx=2)
     ttk.Button(btn_frame, text="✏️ 编辑", command=edit_image, width=8).pack(side=tk.LEFT, padx=2)
     ttk.Button(btn_frame, text="🗑️ 删除", command=remove_image, width=8).pack(side=tk.LEFT, padx=2)
     ttk.Button(btn_frame, text="⚡ 切换", command=toggle_enabled, width=8).pack(side=tk.LEFT, padx=2)
+    # 刷新按钮：从磁盘重新加载图片配置并更新 GUI（不会阻塞主线程）
+    def refresh_images_from_disk():
+        """从磁盘后台重新加载图片数据并通知后台线程刷新像素映射。"""
+        # 在后台线程加载图片数据以避免阻塞 GUI
+        def _worker():
+            try:
+                import tool
+                new_images = tool.load_all_images(config)
+                if new_images:
+                    # 更新外层 images_data 变量并通知后台重建 target_map
+                    nonlocal images_data
+                    images_data = new_images
+                    try:
+                        with gui_state['lock']:
+                            gui_state['images_data'] = images_data
+                            gui_state['reload_pixels'] = True
+                    except Exception:
+                        pass
+                    # 在主线程刷新树视图
+                    try:
+                        root.after(0, refresh_tree)
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        root.after(0, lambda: messagebox.showwarning('刷新', '未能加载到任何图片（检查路径/启用状态）。'))
+                    except Exception:
+                        pass
+            except Exception as e:
+                try:
+                    root.after(0, lambda: messagebox.showerror('刷新失败', f'刷新图片时出错: {e}'))
+                except Exception:
+                    pass
+
+        try:
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+        except Exception as e:
+            try:
+                messagebox.showerror('错误', f'无法刷新图片: {e}')
+            except Exception:
+                pass
+
+    ttk.Button(btn_frame, text='🔄 刷新', command=refresh_images_from_disk, width=8).pack(side=tk.LEFT, padx=2)
 
     # 控制按钮（放在进度信息区域）
     ctrl_btn_frame = ttk.Frame(info_frame)
@@ -457,46 +620,120 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
         if len(config['images']) == 1:
             img_idx = 0
         else:
-            # 创建选择窗口
+            # 创建选择窗口（改为模态并确保 Listbox 可交互）
             select_win = tk.Toplevel(root)
             select_win.title("选择要调整的图片")
             select_win.geometry("300x200")
-            
+            select_win.transient(root)
+            # 让窗口模态化，阻止父窗口交互
+            try:
+                select_win.grab_set()
+            except Exception:
+                pass
+
             ttk.Label(select_win, text="请选择要调整起点的图片:").pack(pady=10)
-            
+
             listbox = tk.Listbox(select_win)
             listbox.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-            
+
             for idx, img in enumerate(config['images']):
-                listbox.insert(tk.END, f"{idx+1}. {os.path.basename(img.get('image_path', ''))}")
-            
-            listbox.select_set(0)
-            
-            selected_idx = [0]
-            
-            def on_select():
-                if listbox.curselection():
-                    selected_idx[0] = listbox.curselection()[0]
+                if str(img.get('type','')).lower() == 'attack':
+                    _kind = (img.get('attack_kind') or 'white')
+                    _kind_cn = {'white': '白点', 'green': '亮绿色点', 'random': '随机色点'}.get(_kind, _kind)
+                    _name = f"[攻]{_kind_cn} {img.get('width','?')}x{img.get('height','?')}"
+                else:
+                    _name = os.path.basename(img.get('image_path',''))
+                listbox.insert(tk.END, f"{idx+1}. {_name}")
+
+            # 初始选择第一项并确保焦点在 listbox
+            if listbox.size() > 0:
+                listbox.select_set(0)
+                listbox.activate(0)
+                listbox.focus_set()
+
+            selected_idx = {'value': 0}
+
+            def on_select(event=None):
+                sel = listbox.curselection()
+                if sel:
+                    selected_idx['value'] = sel[0]
+                    try:
+                        select_win.grab_release()
+                    except Exception:
+                        pass
                     select_win.destroy()
                 else:
                     messagebox.showwarning("提示", "请选择一个图片")
-            
+
+            # 支持双击和回车确认
+            listbox.bind('<Double-1>', on_select)
+            listbox.bind('<Return>', on_select)
+
+            # 确定按钮
             ttk.Button(select_win, text="确定", command=on_select).pack(pady=5)
-            
+
+            # 等待窗口关闭（模态）
             select_win.wait_window()
-            img_idx = selected_idx[0]
+            img_idx = selected_idx.get('value', 0)
         
         img_config = config['images'][img_idx]
         
         # 创建拖动窗口
         drag_win = tk.Toplevel(root)
-        drag_win.title(f'拖动设置起点 - {os.path.basename(img_config["image_path"])}')
+        if str(img_config.get('type','')).lower() == 'attack':
+            _kind = (img_config.get('attack_kind') or 'white')
+            _kind_cn = {'white': '白点', 'green': '亮绿色点', 'random': '随机色点'}.get(_kind, _kind)
+            _tname = f"[攻击] {_kind_cn} {img_config.get('width','?')}x{img_config.get('height','?')}"
+        else:
+            _tname = os.path.basename(img_config.get('image_path',''))
+        drag_win.title(f'拖动设置起点 - {_tname}')
         drag_win.geometry(f"{BOARD_W}x{BOARD_H+50}")
         
-        # 加载该图片
+        # 加载该图片（支持攻击类型）
         try:
-            target_img = Image.open(img_config['image_path']).convert('RGBA')
-            img_w, img_h = target_img.size
+            if str(img_config.get('type','')).lower() == 'attack':
+                W = int(img_config.get('width', 0) or 0)
+                H = int(img_config.get('height', 0) or 0)
+                if W <= 0 or H <= 0:
+                    raise ValueError('攻击图片尺寸无效')
+                from PIL import Image as _Image
+                target_img = _Image.new('RGBA', (W, H), (0,0,0,0))
+                _kind = (img_config.get('attack_kind') or 'white').lower()
+                import random as _random
+                _rnd = _random.Random(W * 1315423911 ^ H * 2654435761)
+                total = W * H
+                dot_count = img_config.get('dot_count')
+                try:
+                    dot_count = int(dot_count) if dot_count is not None else max(1, total // 50)
+                except Exception:
+                    dot_count = max(1, total // 50)
+                _px = target_img.load()
+                _used = set()
+                for _ in range(dot_count):
+                    _tries = 0
+                    while _tries < 5:
+                        _x = _rnd.randrange(0, W)
+                        _y = _rnd.randrange(0, H)
+                        if (_x, _y) not in _used:
+                            _used.add((_x, _y))
+                            break
+                        _tries += 1
+                    if _kind == 'white':
+                        _color = (255, 255, 255, 255)
+                    elif _kind == 'green':
+                        _color = (0, 255, 0, 255)
+                    elif _kind == 'random':
+                        _color = (_rnd.randrange(256), _rnd.randrange(256), _rnd.randrange(256), 255)
+                    else:
+                        _color = (255, 255, 255, 255)
+                    try:
+                        _px[_x, _y] = _color
+                    except Exception:
+                        pass
+                img_w, img_h = W, H
+            else:
+                target_img = Image.open(img_config['image_path']).convert('RGBA')
+                img_w, img_h = target_img.size
         except Exception as e:
             messagebox.showerror("错误", f"无法加载图片: {e}")
             drag_win.destroy()

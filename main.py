@@ -112,7 +112,7 @@ async def send_paint_data(ws, interval_ms):
             if merged_data:
                 try:
                     await ws.send(merged_data)
-                    logging.info(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
+                    logging.debug(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
                 except websockets.ConnectionClosed:
                     logging.warning("发送数据时 WebSocket 连接已关闭。")
                     break
@@ -186,7 +186,7 @@ def build_target_map(pixels, width, height, start_x, start_y, config=None):
             else:
                 skipped_out_of_bounds += 1
 
-    logging.info(f"目标像素数: {len(target)}（非透明且在画布范围内） 已跳过透明: {skipped_transparent} 越界: {skipped_out_of_bounds} 总像素: {total_pixels}")
+    logging.debug(f"目标像素数: {len(target)}（非透明且在画布范围内） 已跳过透明: {skipped_transparent} 越界: {skipped_out_of_bounds} 总像素: {total_pixels}")
     return target
 
 
@@ -226,7 +226,7 @@ def fetch_board_snapshot():
                 g = data[idx + 1]
                 b = data[idx + 2]
                 board[(x, y)] = (r, g, b)
-        logging.info("已获取画板快照。")
+        logging.debug("已获取画板快照。")
         return board
     except requests.RequestException as e:
         logging.warning(f"获取画板快照失败: {e}")
@@ -349,7 +349,7 @@ def load_image_pixels(config):
         img = Image.open(image_path).convert('RGBA')
         width, height = img.size
         pixels = list(img.getdata())
-        logging.info(f"已加载目标图片: {image_path} 大小: {width}x{height}")
+        logging.debug(f"已加载目标图片: {image_path} 大小: {width}x{height}")
         return pixels, width, height
     except Exception:
         logging.exception("加载目标图片失败")
@@ -367,17 +367,30 @@ def get_token(uid: int, access_key: str):
     
     try:
         session = requests.Session()
+        # 禁用环境代理，避免被系统代理干扰
+        try:
+            session.trust_env = False
+        except Exception:
+            pass
         # 2025-10-14 文档与仓库说明：获取 Token 的接口为 POST /api/auth/gettoken
         url = f"{API_BASE_URL}/api/auth/gettoken"
-        try:
-            resp = session.post(url, json={'uid': uid, 'access_key': access_key}, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.HTTPError as e:
-            logging.warning(f"获取 token 失败 uid={uid}: {e}")
-            return None
-        except Exception as e:
-            logging.warning(f"获取 token 时发生异常 uid={uid}: {e}")
+        # 带指数回退的简易重试
+        data = None
+        delay = 1.0
+        for attempt in range(5):
+            try:
+                resp = session.post(url, json={'uid': uid, 'access_key': access_key}, timeout=10)
+                resp.raise_for_status()
+                data = resp.json()
+                break
+            except requests.HTTPError as e:
+                logging.warning(f"获取 token 失败 uid={uid} (HTTP): {e}")
+                break
+            except Exception as e:
+                logging.warning(f"获取 token 尝试 {attempt+1}/5 失败 uid={uid}: {e}")
+                time.sleep(delay)
+                delay = min(delay * 2, 10)
+        if data is None:
             return None
 
         # 解析多种可能的响应包装，优先寻找 token 字段
@@ -421,13 +434,28 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
     user_cooldown_seconds = config.get("user_cooldown_seconds", 30)
 
     # 合并所有图片的目标像素映射（处理重叠，高权重优先）
-    target_map, positions_by_mode = tool.merge_target_maps(images_data)
+    # tool.merge_target_maps 现在也返回每个绝对坐标对应的图片索引映射 pos_to_image_idx
+    result = tool.merge_target_maps(images_data)
+    # 兼容旧接口：如果返回两个值则填充空映射
+    if isinstance(result, tuple) and len(result) == 3:
+        target_map, positions_by_mode, pos_to_image_idx = result
+    else:
+        target_map, positions_by_mode = result
+        pos_to_image_idx = {}
     
     # 合并所有绘制模式的坐标列表（保持原有顺序）
     target_positions = []
     for mode in ['horizontal', 'concentric', 'random']:  # 按优先级合并
         if mode in positions_by_mode:
             target_positions.extend(positions_by_mode[mode])
+    # 构建按图片分组的坐标（用于公平派发）
+    from collections import defaultdict, deque as _deque
+    positions_by_image = defaultdict(list)
+    for pos in target_positions:
+        idx = pos_to_image_idx.get(pos)
+        if idx is not None:
+            positions_by_image[idx].append(pos)
+    positions_by_image = {k: _deque(v) for k, v in positions_by_image.items()}
     
     logging.info(f"已加载 {len(images_data)} 个图片，合并后共 {len(target_map)} 个目标像素")
 
@@ -449,29 +477,18 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         if _k in os.environ:
             _saved_env[_k] = os.environ.pop(_k)
     if _saved_env:
-        logging.info("检测到环境代理变量，已临时清除以建立直接 WebSocket 连接。")
-
-    # 临时移除环境中的代理变量，避免 websockets 库自动通过 HTTP_PROXY/HTTPS_PROXY 走代理
-    proxy_keys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
-    _saved_env = {}
-    for _k in proxy_keys:
-        if _k in os.environ:
-            _saved_env[_k] = os.environ.pop(_k)
-    if _saved_env:
-        logging.info("检测到环境代理变量，已临时清除以建立直接 WebSocket 连接。")
-
-    # 临时移除环境中的代理变量，避免 websockets 库自动通过 HTTP_PROXY/HTTPS_PROXY 走代理
-    proxy_keys = ['HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy']
-    _saved_env = {}
-    for _k in proxy_keys:
-        if _k in os.environ:
-            _saved_env[_k] = os.environ.pop(_k)
-    if _saved_env:
-        logging.info("检测到环境代理变量，已临时清除以建立直接 WebSocket 连接。")
+        logging.debug("检测到环境代理变量，已临时清除以建立直接 WebSocket 连接。")
 
     try:
         async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
             logging.info("WebSocket 连接已打开。")
+            # 新连接建立时清空待发送队列，避免残留数据
+            try:
+                tool.paint_queue.clear()
+                if hasattr(tool, 'total_size'):
+                    tool.total_size = 0
+            except Exception:
+                pass
 
             # 启动定时发送任务（粘包）
             sender_task = asyncio.create_task(tool.send_paint_data(ws, paint_interval_ms))
@@ -487,6 +504,8 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     if gui_state is not None:
                         with gui_state['lock']:
                             gui_state['board_state'] = board_state.copy()
+                            # expose pos->image mapping (initial)
+                            gui_state['pos_to_image_idx'] = pos_to_image_idx
             except Exception:
                 logging.debug("初始化画板快照时出现异常，继续使用空的 board_state。")
             # 画板状态改变事件（用于唤醒调度器进行即时修复）
@@ -638,6 +657,11 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                             gui_state['ready_count'] = ready_count
                             gui_state['resistance_pct'] = resistance_pct
                             gui_state['user_covered'] = user_covered
+                            # 显示累计派发次数（配置索引 -> 次数）
+                            try:
+                                gui_state['assigned_per_image'] = dict(assigned_counter_per_image)
+                            except Exception:
+                                gui_state['assigned_per_image'] = {}
 
                     # 进度条文本与条形
                     bar_len = 40
@@ -726,11 +750,58 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             cooldown_until = {u['uid']: 0.0 for u in users_with_tokens}  # monotonic 时间戳
             in_watch_mode = False
             round_idx = 0
+            # 累计派发计数（按配置索引聚合）
+            from collections import defaultdict as _dd
+            assigned_counter_per_image = _dd(int)
 
             # 现在 cooldown_until 已初始化，再启动进度显示器
             progress_task = asyncio.create_task(progress_printer())
 
+            # 轮转图片列表与游标（避免某一模式/图片饿死）
+            try:
+                rr_images_raw = sorted(set(pos_to_image_idx.values()))
+            except Exception:
+                rr_images_raw = []
+            # 根据 images_data 中记录的 config_index -> weight 构建加权轮转列表
+            weight_map = {}
+            try:
+                for img in images_data:
+                    cfg_idx = img.get('config_index')
+                    if cfg_idx is not None:
+                        weight_map[cfg_idx] = float(img.get('weight', 1.0))
+            except Exception:
+                weight_map = {}
+
+            rr_images = []
+            # 缩放因子：每个权重单位大约重复的基数（1.0 -> 10 次），可调
+            scale = 10
+            for cfg_idx in rr_images_raw:
+                w = max(0.0, weight_map.get(cfg_idx, 1.0))
+                repeat = max(1, int(round(w * scale)))
+                rr_images.extend([cfg_idx] * repeat)
+            # 若所有 weight 都异常导致 rr_images 为空，则回退为 raw 列表
+            if not rr_images:
+                rr_images = rr_images_raw
+            # 调试信息：记录每个配置索引的权重与在轮转列表中的出现次数
+            try:
+                from collections import Counter
+                dist = Counter(rr_images)
+                logging.debug(f"轮转队列权重映射: {weight_map} -> 轮转分布: {dict(dist)} (scale={scale})")
+            except Exception:
+                pass
+            rr_cursor = 0
+
             while True:
+                # 若连接已关闭，则退出以便外层重连
+                try:
+                    is_open = getattr(ws, "open", None)
+                    if is_open is None:
+                        is_open = not getattr(ws, "closed", False)
+                except Exception:
+                    is_open = False
+                if not is_open:
+                    logging.warning("检测到 WebSocket 已关闭，退出当前循环以便重连。")
+                    break
                 # 优先处理 GUI 请求的配置刷新（如图片路径、起点或模式被修改并调用 refresh_config）
                 if gui_state is not None and gui_state.get('reload_pixels'):
                     try:
@@ -738,15 +809,32 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                             gui_state['reload_pixels'] = False
                             updated_images_data = gui_state.get('images_data', images_data)
                         # 重新构建目标映射与绘制顺序
-                        target_map, positions_by_mode = tool.merge_target_maps(updated_images_data)
+                        _res = tool.merge_target_maps(updated_images_data)
+                        if isinstance(_res, tuple) and len(_res) == 3:
+                            target_map, positions_by_mode, pos_to_image_idx = _res
+                        else:
+                            target_map, positions_by_mode = _res
+                            pos_to_image_idx = {}
                         target_positions = []
                         for mode in ['horizontal', 'concentric', 'random']:
                             if mode in positions_by_mode:
                                 target_positions.extend(positions_by_mode[mode])
+                        # 重建图片轮转队列
+                        try:
+                            rr_images = sorted(set(pos_to_image_idx.values()))
+                        except Exception:
+                            rr_images = []
+                        rr_cursor = 0
+                        # 新配置后重置累计派发计数
+                        try:
+                            assigned_counter_per_image.clear()
+                        except Exception:
+                            pass
                         if gui_state is not None:
                             with gui_state['lock']:
                                 gui_state['total'] = len(target_positions)
                                 gui_state['mismatched'] = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
+                                gui_state['pos_to_image_idx'] = dict(pos_to_image_idx)
                         logging.info('已根据 GUI 请求刷新目标像素与绘制顺序。')
                     except Exception:
                         logging.exception('处理 GUI 刷新请求时出错')
@@ -764,11 +852,48 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
 
                 assigned = 0
                 if remaining and available_users:
-                    # 立即为可用用户分配修复任务（每人 1 个）
+                    # 公平派发：按照图片轮转，从各图片的队列取下一个未达标像素
+                    # 若无法建立图片队列，则回退到全局顺序
+                    # 先构建本轮的按图片剩余队列
+                    rem_by_img = {}
+                    if remaining:
+                        tmp = {}
+                        for pos in remaining:
+                            i2 = pos_to_image_idx.get(pos)
+                            if i2 is None:
+                                continue
+                            lst = tmp.setdefault(i2, [])
+                            lst.append(pos)
+                        from collections import deque as __dq
+                        rem_by_img = {k: __dq(v) for k, v in tmp.items()}
+
                     for user in available_users:
                         if not remaining:
                             break
-                        x, y = remaining.pop(0) # 从列表头部取点，以遵循原始顺序
+                        pick = None
+                        picked_img_idx = None
+                        if rr_images and rem_by_img:
+                            tried = 0
+                            while tried < len(rr_images):
+                                img_idx = rr_images[rr_cursor % len(rr_images)]
+                                q = rem_by_img.get(img_idx)
+                                if q and len(q) > 0:
+                                    pick = q.popleft()
+                                    picked_img_idx = img_idx
+                                    rr_cursor = (rr_cursor + 1) % max(1, len(rr_images))
+                                    # 从全局 remaining 中移除此点
+                                    try:
+                                        remaining.remove(pick)
+                                    except ValueError:
+                                        pass
+                                    break
+                                else:
+                                    rr_cursor = (rr_cursor + 1) % max(1, len(rr_images))
+                                    tried += 1
+                        if pick is None:
+                            pick = remaining.pop(0)
+                            picked_img_idx = pos_to_image_idx.get(pick)
+                        x, y = pick
                         r, g, b = target_map[(x, y)]
                         uid = user['uid']
                         token = user['token']
@@ -776,7 +901,18 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         await tool.paint(ws, uid, token, r, g, b, x, y, paint_id)
                         # 记录 pending paint，待画板更新广播到来时归属成功绘制
                         try:
-                            pending_paints.append({'uid': uid, 'paint_id': paint_id, 'pos': (x, y), 'color': (r, g, b), 'time': time.monotonic()})
+                            image_idx = picked_img_idx if picked_img_idx is not None else pos_to_image_idx.get((x, y)) if 'pos_to_image_idx' in locals() else None
+                            pending_paints.append({
+                                'uid': uid,
+                                'paint_id': paint_id,
+                                'pos': (x, y),
+                                'color': (r, g, b),
+                                'time': time.monotonic(),
+                                'image_idx': image_idx
+                            })
+                            # 累计派发计数（按配置索引）
+                            if image_idx is not None:
+                                assigned_counter_per_image[image_idx] += 1
                         except Exception:
                             pass
                         logging.info(f"UID {uid} 播报绘制像素: ({x},{y}) color=({r},{g},{b}) id={paint_id}")
@@ -848,7 +984,48 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         # 恢复之前的环境变量（如果有）
         if _saved_env:
             os.environ.update(_saved_env)
-            logging.info("已恢复环境代理变量。")
+            logging.debug("已恢复环境代理变量。")
+
+
+async def run_forever(config, users_with_tokens, images_data, debug=False, gui_state=None):
+    """带自动重连的持久运行包装器。
+
+    当网络断开、服务器重启或偶发异常导致内部循环退出时，按指数回退重连，
+    直到收到 GUI 停止信号或进程被终止。
+    """
+    backoff = 1.0
+    backoff_max = 60.0
+    while True:
+        # GUI 请求停止则退出
+        if gui_state is not None and gui_state.get('stop'):
+            logging.info('检测到停止标记，结束 run_forever 循环。')
+            break
+        try:
+            await handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state)
+            # 若自然返回且未设置停止，视为异常退出，进入重连
+            if gui_state is not None and gui_state.get('stop'):
+                break
+            logging.warning('主循环意外结束，将在短暂等待后尝试重连。')
+        except (websockets.exceptions.ConnectionClosedError,
+                websockets.exceptions.ConnectionClosedOK,
+                websockets.exceptions.InvalidStatusCode,
+                OSError,
+                asyncio.TimeoutError) as e:
+            logging.warning(f'连接中断或超时：{e}，准备重连。')
+        except Exception:
+            logging.exception('运行过程中出现未预期异常，准备重连。')
+
+        # 指数回退的等待；等待期间可响应停止
+        wait_left = backoff
+        logging.info(f'将在 {wait_left:.1f}s 后重连。')
+        while wait_left > 0:
+            if gui_state is not None and gui_state.get('stop'):
+                logging.info('检测到停止标记，放弃重连等待。')
+                return
+            await asyncio.sleep(min(1.0, wait_left))
+            wait_left -= 1.0
+        backoff = min(backoff * 2.0, backoff_max)
+    logging.info('run_forever 正常退出。')
 
 
 def main():
@@ -901,24 +1078,52 @@ def main():
             ak = user.get('access_key')
             token = None
             token_from_config = user.get('token')
+            token_time = user.get('token_time', 0)
+            now_ts = int(time.time())
             # 若配置中有 access_key，则优先通过接口获取真实 token，失败再回退到配置中的 token
             if ak:
-                fetched = None
-                try:
-                    fetched = get_token(uid, ak)
-                except Exception:
-                    fetched = None
-                if fetched:
-                    token = fetched
-                elif token_from_config:
+                # 如果配置中已有 token 且 token_time 在 1 day 内，则复用并跳过请求
+                if token_from_config and token_time and (now_ts - int(token_time) < 86400):
                     token = token_from_config
-                    logging.warning(f"获取 token 失败，回退使用配置中的 token: uid={uid}")
                 else:
-                    logging.warning(f"既无法通过 access_key 获取 token，也未在配置中提供 token: uid={uid}，跳过。")
+                    fetched = None
+                    try:
+                        fetched = get_token(uid, ak)
+                    except Exception:
+                        fetched = None
+                    if fetched:
+                        token = fetched
+                        # 将新获取的 token 及时间写回配置并持久化
+                        try:
+                            user['token'] = token
+                            user['token_time'] = now_ts
+                            save_config(config)
+                        except Exception:
+                            logging.exception('写回 token 到 config 失败')
+                    elif token_from_config:
+                        # 获取失败，回退使用配置中的 token（可能无 token_time 或已过期），记录警告并保存当前时间以避免频繁重试
+                        token = token_from_config
+                        logging.warning(f"获取 token 失败，回退使用配置中的 token: uid={uid}")
+                        try:
+                            user['token_time'] = now_ts
+                            save_config(config)
+                        except Exception:
+                            pass
+                    else:
+                        logging.warning(f"既无法通过 access_key 获取 token，也未在配置中提供 token: uid={uid}，跳过。")
             else:
                 # 无 access_key，若配置含 token 则直接使用
                 if token_from_config:
-                    token = token_from_config
+                    # 若存在 token_time 并且未过期则直接使用；否则标记当前时间并保存
+                    if token_time and (now_ts - int(token_time) < 86400):
+                        token = token_from_config
+                    else:
+                        token = token_from_config
+                        try:
+                            user['token_time'] = now_ts
+                            save_config(config)
+                        except Exception:
+                            pass
                 else:
                     logging.warning(f"用户条目缺少 access_key 且未提供 token: uid={uid}，跳过。")
 
@@ -1014,8 +1219,8 @@ def main():
             pass
 
         if cli_only or not gui_available:
-            # 保持原有 CLI 行为
-            asyncio.run(handle_websocket(config, users_with_tokens, images_data, debug))
+            # CLI/无 GUI：使用带重连的持久运行
+            asyncio.run(run_forever(config, users_with_tokens, images_data, debug))
         else:
             # GUI 模式：创建线程安全的 gui_state 并在后台运行 asyncio
             gui_state = {
@@ -1028,7 +1233,7 @@ def main():
 
             def run_asyncio_loop():
                 try:
-                    asyncio.run(handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state))
+                    asyncio.run(run_forever(config, users_with_tokens, images_data, debug, gui_state=gui_state))
                 except Exception:
                     logging.exception('后台 asyncio 任务异常')
 

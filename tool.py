@@ -6,6 +6,8 @@ import time
 import random
 from uuid import UUID
 from PIL import Image
+import asyncio
+import websockets
 
 # --- 绘画相关工具与队列（从 main.py 拆分） ---
 # 全局粘包队列（供 send_paint_data 与 paint 使用）
@@ -58,7 +60,7 @@ async def paint(ws, uid, token, r, g, b, x, y, paint_id):
 async def send_paint_data(ws, interval_ms):
     """定时发送粘合后的绘画数据包（后台任务）"""
     while True:
-        await __import__('asyncio').sleep(interval_ms / 1000.0)
+        await asyncio.sleep(interval_ms / 1000.0)
         try:
             is_open = getattr(ws, "open", None)
             if is_open is None:
@@ -70,9 +72,34 @@ async def send_paint_data(ws, interval_ms):
             if merged_data:
                 try:
                     await ws.send(merged_data)
-                    logging.info(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
+                    logging.debug(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
+                except (websockets.exceptions.ConnectionClosed, websockets.exceptions.ConnectionClosedError, websockets.exceptions.ConnectionClosedOK) as e:
+                    # 连接已关闭（或未完成关闭握手），将数据重新入队并退出，交由上层重连逻辑处理
+                    logging.warning(f"发送数据时连接已关闭: {e}; 重新入队数据并退出发送任务。")
+                    try:
+                        append_to_queue(merged_data)
+                    except Exception:
+                        # 如果 append 失败，则放到全局 paint_queue 保底
+                        try:
+                            paint_queue.insert(0, merged_data)
+                        except Exception:
+                            pass
+                    break
                 except Exception as e:
+                    # 其它异常：记录并将数据重入队，短暂等待后继续尝试
                     logging.error(f"发送数据时出错: {e}")
+                    try:
+                        append_to_queue(merged_data)
+                    except Exception:
+                        try:
+                            paint_queue.insert(0, merged_data)
+                        except Exception:
+                            pass
+                    # 避免快速循环重试造成 CPU 飙升
+                    try:
+                        await asyncio.sleep(1.0)
+                    except Exception:
+                        pass
 
 
 def build_target_map(pixels, width, height, start_x, start_y, config=None):
@@ -129,19 +156,36 @@ def build_target_map(pixels, width, height, start_x, start_y, config=None):
             else:
                 skipped_out_of_bounds += 1
 
-    logging.info(f"目标像素数: {len(target)}（非透明且在画布范围内） 已跳过透明: {skipped_transparent} 越界: {skipped_out_of_bounds} 总像素: {total_pixels}")
+    logging.debug(f"目标像素数: {len(target)}（非透明且在画布范围内） 已跳过透明: {skipped_transparent} 越界: {skipped_out_of_bounds} 总像素: {total_pixels}")
     return target
 
 
 def fetch_board_snapshot(api_base_url="https://paintboard.luogu.me"):
-    """通过 HTTP 接口获取当前画板所有像素的快照，返回 dict {(x,y):(r,g,b)}。"""
+    """通过 HTTP 接口获取当前画板所有像素的快照，返回 dict {(x,y):(r,g,b)}。
+
+    带简易重试与禁用环境代理，以提升在临时断网/代理环境下的稳定性。
+    """
     url = f"{api_base_url}/api/paintboard/getboard"
+    session = requests.Session()
     try:
-        session = requests.Session()
-        session.trust_env = False
-        resp = session.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.content
+        try:
+            session.trust_env = False
+        except Exception:
+            pass
+        data = None
+        delay = 1.0
+        for attempt in range(4):
+            try:
+                resp = session.get(url, timeout=10)
+                resp.raise_for_status()
+                data = resp.content
+                break
+            except Exception as e:
+                logging.warning(f"获取画板快照尝试 {attempt+1}/4 失败: {e}")
+                time.sleep(delay)
+                delay = min(delay * 2, 8)
+        if data is None:
+            return {}
         expected = 1000 * 600 * 3
         if len(data) < expected:
             logging.warning(f"获取画板快照数据长度不够: {len(data)} < {expected}")
@@ -157,11 +201,8 @@ def fetch_board_snapshot(api_base_url="https://paintboard.luogu.me"):
                 g = data[idx + 1]
                 b = data[idx + 2]
                 board[(x, y)] = (r, g, b)
-        logging.info("已获取画板快照。")
+        logging.debug("已获取画板快照。")
         return board
-    except requests.RequestException as e:
-        logging.warning(f"获取画板快照失败: {e}")
-        return {}
     except Exception as e:
         logging.exception(f"解析画板快照时出现异常: {e}")
         return {}
@@ -197,7 +238,7 @@ def load_image_pixels(config):
         img = Image.open(image_path).convert('RGBA')
         width, height = img.size
         pixels = list(img.getdata())
-        logging.info(f"已加载目标图片: {image_path} 大小: {width}x{height}")
+        logging.debug(f"已加载目标图片: {image_path} 大小: {width}x{height}")
         return pixels, width, height
     except Exception:
         logging.exception("加载目标图片失败")
@@ -206,7 +247,11 @@ def load_image_pixels(config):
 
 def load_all_images(config):
     """加载所有启用的图片配置，返回图片信息列表。
-    
+
+    支持两类来源：
+    1) 普通文件图片（image_path 存在且可读）
+    2) 特殊攻击图片（type == 'attack'），按配置生成随机点阵
+
     返回格式：[
         {
             'pixels': [...],
@@ -216,13 +261,14 @@ def load_all_images(config):
             'start_y': int,
             'draw_mode': str,
             'weight': float,
-            'image_path': str
+            'image_path': str (可选)
+            'config_index': int
         },
         ...
     ]
     """
     images_config = config.get('images', [])
-    
+
     # 如果没有 images 配置，尝试兼容旧格式
     if not images_config:
         image_path = config.get('image_path')
@@ -235,22 +281,93 @@ def load_all_images(config):
                 'weight': 1.0,
                 'enabled': True
             }]
-    
+
+    def _gen_attack_pixels(img_cfg):
+        """根据攻击配置生成 RGBA 像素列表与尺寸。背景透明，点为实心 1px。
+
+        支持 attack_kind: white | green | random
+        可选字段：dot_count（默认按面积 2% 取整）
+        """
+        width = int(img_cfg.get('width', 0) or 0)
+        height = int(img_cfg.get('height', 0) or 0)
+        if width <= 0 or height <= 0:
+            return None, 0, 0
+        total = width * height
+        dot_count = img_cfg.get('dot_count')
+        try:
+            dot_count = int(dot_count) if dot_count is not None else max(1, total // 50)  # ~2%
+        except Exception:
+            dot_count = max(1, total // 50)
+
+        kind = (img_cfg.get('attack_kind') or img_cfg.get('attack') or 'white').lower()
+        rnd = random.Random(width * 1315423911 ^ height * 2654435761)
+
+        pixels = [(0, 0, 0, 0)] * total
+        used = set()
+        for _ in range(dot_count):
+            # 防止死循环，尝试有限次
+            tries = 0
+            while tries < 5:
+                x = rnd.randrange(0, width)
+                y = rnd.randrange(0, height)
+                idx = y * width + x
+                if idx not in used:
+                    used.add(idx)
+                    break
+                tries += 1
+            if not used:
+                continue
+            if kind == 'white':
+                color = (255, 255, 255)
+            elif kind == 'green':
+                color = (0, 255, 0)
+            elif kind == 'random':
+                color = (rnd.randrange(256), rnd.randrange(256), rnd.randrange(256))
+            else:
+                color = (255, 255, 255)
+            try:
+                pixels[idx] = (color[0], color[1], color[2], 255)
+            except Exception:
+                pass
+        return pixels, width, height
+
     loaded_images = []
-    for img_config in images_config:
+    for cfg_idx, img_config in enumerate(images_config):
         if not img_config.get('enabled', True):
             continue
-            
+
+        # 分支：特殊攻击图片
+        if str(img_config.get('type', '')).lower() == 'attack':
+            try:
+                pixels, width, height = _gen_attack_pixels(img_config)
+                if pixels and width > 0 and height > 0:
+                    loaded_images.append({
+                        'pixels': pixels,
+                        'width': width,
+                        'height': height,
+                        'start_x': int(img_config.get('start_x', 0)),
+                        'start_y': int(img_config.get('start_y', 0)),
+                        'draw_mode': img_config.get('draw_mode', 'random'),
+                        'weight': float(img_config.get('weight', 1.0)),
+                        'config_index': int(cfg_idx),
+                        'attack_kind': img_config.get('attack_kind', 'white')
+                    })
+                else:
+                    logging.warning(f"跳过无效的攻击图片配置（尺寸/像素为空）: index={cfg_idx}")
+            except Exception:
+                logging.exception(f"生成攻击图片失败: index={cfg_idx}")
+            continue
+
+        # 分支：普通文件图片
         image_path = img_config.get('image_path')
         if not image_path or not os.path.exists(image_path):
             logging.warning(f"跳过不存在的图片: {image_path}")
             continue
-            
         try:
             img = Image.open(image_path).convert('RGBA')
             width, height = img.size
             pixels = list(img.getdata())
-            
+
             loaded_images.append({
                 'pixels': pixels,
                 'width': width,
@@ -259,12 +376,13 @@ def load_all_images(config):
                 'start_y': int(img_config.get('start_y', 0)),
                 'draw_mode': img_config.get('draw_mode', 'random'),
                 'weight': float(img_config.get('weight', 1.0)),
-                'image_path': image_path
+                'image_path': image_path,
+                'config_index': int(cfg_idx)
             })
-            logging.info(f"已加载图片: {image_path} 大小: {width}x{height} 权重: {img_config.get('weight', 1.0)}")
+            logging.debug(f"已加载图片: {image_path} 大小: {width}x{height} 权重: {img_config.get('weight', 1.0)}")
         except Exception:
             logging.exception(f"加载图片失败: {image_path}")
-            
+
     return loaded_images
 
 
@@ -275,13 +393,20 @@ def merge_target_maps(images_data):
     - combined_target_map: {(x,y): (r,g,b)} 合并后的目标像素映射
     - target_positions_by_mode: {draw_mode: [(x,y), ...]} 按绘制模式分组的坐标列表
     """
-    # 首先按权重排序（权重高的优先）
-    sorted_images = sorted(images_data, key=lambda x: x['weight'], reverse=True)
-    
+    # 首先按权重排序（权重高的优先），同时保留其在配置中的索引 config_index，
+    # 以便 GUI 使用相同索引统计派发。
+    indexed = []
+    for i, img in enumerate(images_data):
+        cfg_idx = img.get('config_index', i)
+        indexed.append((i, cfg_idx, img))
+    sorted_images = sorted(indexed, key=lambda it: it[2].get('weight', 1.0), reverse=True)
+
     combined_target_map = {}
     positions_by_mode = {}
-    
-    for img_data in sorted_images:
+    # 映射每个绝对坐标到最终被采纳的图片索引（images_data 中的索引）
+    pos_to_image_idx = {}
+
+    for orig_idx, cfg_idx, img_data in sorted_images:
         pixels = img_data['pixels']
         width = img_data['width']
         height = img_data['height']
@@ -306,5 +431,7 @@ def merge_target_maps(images_data):
                 if abs_pos not in combined_target_map:
                     combined_target_map[abs_pos] = target_map[abs_pos]
                     positions_by_mode[draw_mode].append(abs_pos)
+                    # 使用配置索引，保证与 GUI 列表一致
+                    pos_to_image_idx[abs_pos] = cfg_idx
     
-    return combined_target_map, positions_by_mode
+    return combined_target_map, positions_by_mode, pos_to_image_idx
