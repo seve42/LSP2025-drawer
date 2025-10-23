@@ -212,8 +212,34 @@ def load_config():
         cfg.setdefault('users', [])
         return cfg
     except FileNotFoundError:
-        logging.error("找不到 config.json")
-        return None
+        logging.warning("找不到 config.json，正在创建默认配置...")
+        # 生成默认配置并写入
+        default_cfg = {
+            # 示例用户：请替换为真实 UID 与 AccessKey，或在 GUI 中添加用户
+            "users": [
+                {
+                    "uid": 114514,
+                    "access_key": "AAAAAAA"
+                }
+            ],
+            "paint_interval_ms": 20,
+            # 与 config.json.del 保持一致的默认值
+            "round_interval_seconds": 3,
+            "user_cooldown_seconds": 3,
+            "draw_mode": "concentric",
+            "log_level": "INFO",
+            "image_path": "image.png",
+            "start_x": 66,
+            "start_y": 64
+        }
+        try:
+            with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                json.dump(default_cfg, f, ensure_ascii=False, indent=4)
+            logging.info("已创建默认 config.json，请根据需要编辑 users 与 image_path。")
+            return default_cfg
+        except Exception:
+            logging.exception("创建默认 config.json 失败")
+            return None
     except Exception:
         logging.exception("加载配置失败")
         return None
@@ -621,11 +647,31 @@ def main():
         for user in users_list:
             uid = user.get('uid')
             ak = user.get('access_key')
-            token = get_token(uid, ak)
+            token = None
+            token_from_config = user.get('token')
+            # 若配置中有 access_key，则优先通过接口获取真实 token，失败再回退到配置中的 token
+            if ak:
+                fetched = None
+                try:
+                    fetched = get_token(uid, ak)
+                except Exception:
+                    fetched = None
+                if fetched:
+                    token = fetched
+                elif token_from_config:
+                    token = token_from_config
+                    logging.warning(f"获取 token 失败，回退使用配置中的 token: uid={uid}")
+                else:
+                    logging.warning(f"既无法通过 access_key 获取 token，也未在配置中提供 token: uid={uid}，跳过。")
+            else:
+                # 无 access_key，若配置含 token 则直接使用
+                if token_from_config:
+                    token = token_from_config
+                else:
+                    logging.warning(f"用户条目缺少 access_key 且未提供 token: uid={uid}，跳过。")
+
             if token:
                 results.append({'uid': uid, 'token': token})
-            else:
-                logging.warning(f"无法为 UID {uid} 获取 Token，将跳过此用户。")
             idx += 1
             if use_tk and progress is not None:
                 try:
@@ -649,8 +695,11 @@ def main():
     users_with_tokens = get_tokens_with_progress(config.get('users', []), allow_gui=True)
     
     if not users_with_tokens:
-        logging.error("没有可用的用户 Token，程序退出。")
-        return
+        if cli_only:
+            logging.error("没有可用的用户 Token，程序退出（CLI 模式）。")
+            return
+        else:
+            logging.warning("当前没有可用的用户 Token，进入 GUI 模式以便手动添加/填写 Token。继续启动 GUI...")
 
     # 根据 -debug 决定控制台日志行为：非 debug 模式下把 StreamHandler 设为 WARNING，以便只显示进度条
     if not debug:

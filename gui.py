@@ -1,10 +1,12 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 from PIL import Image, ImageTk
+import sys
 import time
 import threading
 import json
 import os
+import sys
 
 CONFIG_FILE = "config.json"
 
@@ -15,6 +17,26 @@ def save_config(config: dict):
             json.dump(config, f, ensure_ascii=False, indent=4)
     except Exception:
         # GUI 中失败不抛出
+        pass
+
+
+def save_and_offer_restart(config: dict):
+    """保存配置并询问用户是否重启程序以应用配置变更。"""
+    save_config(config)
+    try:
+        root = None
+        # 尝试用 tkinter 弹窗询问
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        root = _tk.Tk()
+        root.withdraw()
+        res = _mb.askyesno('配置已保存', '配置已保存。是否立即重启软件以应用更改？')
+        root.destroy()
+        if res:
+            # 以相同的 Python 可执行文件重启当前进程
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+    except Exception:
+        # 如果弹窗失败则忽略重启要求
         pass
 
 
@@ -72,7 +94,7 @@ def start_gui(config, pixels, width, height, users_with_tokens, gui_state):
         with gui_state['lock']:
             gui_state['draw_mode'] = m
         config['draw_mode'] = m
-        save_config(config)
+        save_and_offer_restart(config)
     mode_box.bind('<<ComboboxSelected>>', on_mode_change)
 
     # 预览成果开关
@@ -149,7 +171,7 @@ def start_gui(config, pixels, width, height, users_with_tokens, gui_state):
                 gui_state['start_y'] = int(oy)
             config['start_x'] = int(ox)
             config['start_y'] = int(oy)
-            save_config(config)
+            save_and_offer_restart(config)
             redraw()  # 主窗口也重绘
             top.destroy()
 
@@ -164,36 +186,7 @@ def start_gui(config, pixels, width, height, users_with_tokens, gui_state):
     btn_drag = ttk.Button(ctrl_frame, text='拖动设置起点', command=open_drag_window)
     btn_drag.grid(row=0, column=7, sticky='w', padx=(6, 0))
 
-    # 用户添加区
-    users_frame = ttk.LabelFrame(root, text='用户管理')
-    users_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=8)
-
-    ttk.Label(users_frame, text=f"已配置用户: {len(config.get('users', []))}，有效Token: {len(users_with_tokens)}").grid(row=0, column=0, columnspan=4, sticky='w')
-    ttk.Label(users_frame, text='UID').grid(row=1, column=0, sticky='e')
-    uid_var = tk.StringVar()
-    ttk.Entry(users_frame, textvariable=uid_var, width=12).grid(row=1, column=1, sticky='w')
-    ttk.Label(users_frame, text='AccessKey').grid(row=1, column=2, sticky='e')
-    ak_var = tk.StringVar()
-    ttk.Entry(users_frame, textvariable=ak_var, width=18).grid(row=1, column=3, sticky='w')
-
-    def add_user():
-        try:
-            uid = int(uid_var.get().strip())
-            ak = ak_var.get().strip()
-            if not ak:
-                raise ValueError('access_key 不能为空')
-        except Exception as e:
-            messagebox.showerror('错误', f'输入无效: {e}')
-            return
-        users = config.setdefault('users', [])
-        if any(u.get('uid') == uid for u in users):
-            messagebox.showinfo('提示', '该 UID 已存在于配置中')
-            return
-        users.append({'uid': uid, 'access_key': ak})
-        save_config(config)
-        messagebox.showinfo('成功', '已添加用户并保存配置')
-
-    ttk.Button(users_frame, text='添加用户', command=add_user).grid(row=1, column=4, sticky='w', padx=8)
+    # 用户管理功能已移除（请通过编辑 config.json 或命令行管理用户）
 
     # 缓存的底图与时间戳
     cached = {
