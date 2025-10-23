@@ -9,6 +9,7 @@ import os
 import sys
 
 CONFIG_FILE = "config.json"
+REFRESH_CALLBACK = None
 
 
 def save_config(config: dict):
@@ -30,10 +31,18 @@ def save_and_offer_restart(config: dict):
         from tkinter import messagebox as _mb
         root = _tk.Tk()
         root.withdraw()
-        res = _mb.askyesno('配置已保存', '配置已保存。是否立即重启软件以应用更改？')
+        # 提示改为“是否刷新配置（不会重新获取 token）？”
+        res = _mb.askyesno('配置已保存', '配置已保存。是否刷新配置以应用更改（不会重新获取 token）？')
         root.destroy()
         if res:
-            # 以相同的 Python 可执行文件重启当前进程
+            # 若主程序传入了刷新回调，则调用之（推荐行为：不重启，仅刷新配置）
+            try:
+                if REFRESH_CALLBACK is not None:
+                    REFRESH_CALLBACK(config)
+                    return
+            except Exception:
+                pass
+            # 否则回退到原有的重启行为
             os.execv(sys.executable, [sys.executable] + sys.argv)
     except Exception:
         # 如果弹窗失败则忽略重启要求
@@ -77,7 +86,15 @@ def start_gui(config, pixels, width, height, users_with_tokens, gui_state):
     ctrl_frame.pack(side=tk.TOP, fill=tk.X, padx=8, pady=8)
 
     progress_var = tk.DoubleVar(value=0.0)
-    progressbar = ttk.Progressbar(ctrl_frame, orient=tk.HORIZONTAL, length=400, mode='determinate', variable=progress_var, maximum=100.0)
+    # create progressbar styles (normal and danger red)
+    style = ttk.Style()
+    try:
+        style.theme_use('default')
+    except Exception:
+        pass
+    style.configure('green.Horizontal.TProgressbar', troughcolor='#ddd', background='#4caf50')
+    style.configure('red.Horizontal.TProgressbar', troughcolor='#ddd', background='#d32f2f')
+    progressbar = ttk.Progressbar(ctrl_frame, orient=tk.HORIZONTAL, length=400, mode='determinate', variable=progress_var, maximum=100.0, style='green.Horizontal.TProgressbar')
     progressbar.grid(row=0, column=0, columnspan=4, sticky='w', padx=(0, 10))
 
     lbl_info = ttk.Label(ctrl_frame, text="")
@@ -265,6 +282,15 @@ def start_gui(config, pixels, width, height, users_with_tokens, gui_state):
         canvas.create_image(0, 0, anchor='nw', image=tk_img)
 
     # 文本与进度更新
+    # track history for 60s average growth
+    from collections import deque
+    gui_history = deque()
+    window_seconds = 60.0
+
+    # create separate, fixed-width label for ETA to avoid shifting other controls
+    eta_lbl = ttk.Label(ctrl_frame, text='', width=28, anchor='w')
+    eta_lbl.grid(row=1, column=4, columnspan=4, sticky='w')
+
     def update_status():
         with gui_state['lock']:
             total = int(gui_state.get('total', 0))
@@ -278,6 +304,43 @@ def start_gui(config, pixels, width, height, users_with_tokens, gui_state):
             sy = int(gui_state.get('start_y', config.get('start_y', 0)))
         pct = 100.0 if total <= 0 else max(0.0, min(100.0, (total - mismatched) * 100.0 / max(1, total)))
         progress_var.set(pct)
+
+        # 计算 60s 窗口的平均增长率与 ETA，使用历史样本避免抖动
+        now = time.monotonic()
+        try:
+            gui_history.append((now, pct))
+            while gui_history and (now - gui_history[0][0] > window_seconds):
+                gui_history.popleft()
+            growth = None
+            growth_str = ''
+            eta_str = ''
+            if len(gui_history) >= 2:
+                t0, p0 = gui_history[0]
+                t1, p1 = gui_history[-1]
+                dt = max(1e-6, t1 - t0)
+                growth = (p1 - p0) / dt
+            if growth is None:
+                growth_str = '  增长: --'
+            else:
+                growth_str = f'  增长: {growth:+.2f}%/s'
+                if growth > 1e-6:
+                    remain_pct = max(0.0, 100.0 - pct)
+                    eta_s = remain_pct / growth
+                    if eta_s >= 3600:
+                        eta_str = f'估计剩余: {int(eta_s//3600)}h{int((eta_s%3600)//60)}m'
+                    elif eta_s >= 60:
+                        eta_str = f'估计剩余: {int(eta_s//60)}m{int(eta_s%60)}s'
+                    else:
+                        eta_str = f'估计剩余: {int(eta_s)}s'
+                else:
+                    if pct < 95.0:
+                        eta_str = '估计剩余: 我们正在被攻击，无法抵抗'
+                    else:
+                        eta_str = '估计剩余: 即将完成'
+        except Exception:
+            growth_str = '  增长: --'
+            eta_str = ''
+
         # 构建抵抗率显示：优先显示全局 resistance_pct，否则显示每用户覆盖标记（最多 5 个）
         res_summary = ''
         try:
@@ -296,7 +359,27 @@ def start_gui(config, pixels, width, height, users_with_tokens, gui_state):
         except Exception:
             res_summary = ''
 
-        lbl_info.config(text=f"进度: {pct:6.2f}%  总像素: {total}  未达标: {mismatched}  可用用户: {available} (就绪:{ready})  起点: ({sx},{sy}) 大小: {width}x{height}" + res_summary)
+        # 危险状态时使用红色样式
+        danger = False
+        try:
+            if growth is not None and growth < 0 and pct < 95.0:
+                danger = True
+        except Exception:
+            danger = False
+        try:
+            if danger:
+                progressbar.configure(style='red.Horizontal.TProgressbar')
+            else:
+                progressbar.configure(style='green.Horizontal.TProgressbar')
+        except Exception:
+            pass
+
+        # 更新文本与 ETA 标签（ETA label 固定宽度以避免按钮位移）
+        lbl_info.config(text=f"进度: {pct:6.2f}%  总像素: {total}  未达标: {mismatched}  可用用户: {available} (就绪:{ready})  起点: ({sx},{sy}) 大小: {width}x{height}" + res_summary + growth_str)
+        try:
+            eta_lbl.config(text=eta_str)
+        except Exception:
+            pass
 
     # 定时器：每秒刷新文字与图像；底图构建每 30 秒处理一次
     def tick():

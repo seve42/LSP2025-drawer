@@ -10,8 +10,9 @@ import random
 import sys
 from uuid import UUID
 from PIL import Image
+import tool
 import threading
-from collections import OrderedDict
+from collections import OrderedDict, deque
 
 # --- 全局配置 ---
 API_BASE_URL = "https://paintboard.luogu.me"
@@ -27,9 +28,6 @@ logging.basicConfig(
     ]
 )
 
-# 发送粘包所用的全局队列
-paint_queue = []
-total_size = 0
 # pending paints waiting for confirmation via board update: list of dicts {uid, paint_id, pos, color, time}
 pending_paints = []
 # per-user snapshot of their most recent successful painted pixels: uid -> OrderedDict[(x,y) -> (r,g,b)]
@@ -382,10 +380,10 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
     user_cooldown_seconds = config.get("user_cooldown_seconds", 30)
 
     # 目标像素映射（绝对坐标 -> 目标 RGB）
-    target_map = build_target_map(pixels, width, height, start_x, start_y)
+    target_map = tool.build_target_map(pixels, width, height, start_x, start_y)
     
     # 根据模式生成有序的绘画坐标
-    ordered_coords = get_draw_order(draw_mode, width, height)
+    ordered_coords = tool.get_draw_order(draw_mode, width, height)
     # 转换为绝对坐标
     target_positions = [(start_x + x, start_y + y) for x, y in ordered_coords if (start_x + x, start_y + y) in target_map]
     current_draw_mode = draw_mode
@@ -416,12 +414,12 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
             logging.info("WebSocket 连接已打开。")
 
             # 启动定时发送任务（粘包）
-            sender_task = asyncio.create_task(send_paint_data(ws, paint_interval_ms))
+            sender_task = asyncio.create_task(tool.send_paint_data(ws, paint_interval_ms))
 
             # 维护当前画板已知颜色状态（初始化为服务端快照，以便重启后立即知道已达成的像素）
             board_state = {}
             try:
-                snapshot = fetch_board_snapshot()
+                snapshot = tool.fetch_board_snapshot()
                 if snapshot:
                     # 使用完整快照，便于 GUI 显示整个画板
                     board_state = snapshot.copy()
@@ -525,34 +523,24 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
 
             # 启动进度显示器（每秒刷新）
             async def progress_printer():
-                # 模式前缀，例如: [模式:horizontal] 
+                # 模式前缀，例如: [模式:horizontal]
                 mode_prefix = f"[模式:{draw_mode}] "
+                # history of (time, pct) for averaging over window_seconds
+                history = deque()
+                window_seconds = 60.0
                 while True:
                     # 计算完成度（不符合的像素数会降低完成度）
                     total = len(target_positions)
                     mismatched = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
                     completed = max(0, total - mismatched)
                     pct = (completed / total * 100) if total > 0 else 100.0
-                    # 可用用户数
+
+                    # 可用用户数与就绪数
                     now = time.monotonic()
-                    # 逻辑修正：冷却中的用户仍应被视为“可用”（他们拥有有效 token 并未因绘制失败失效）
-                    # 因此这里把可用计数设为所有已获取 token 的用户数，同时计算就绪（未冷却）用户数用于分配显示
                     available = len(users_with_tokens)
                     ready_count = len([u for u in users_with_tokens if cooldown_until.get(u['uid'], 0.0) <= now])
-                    bar_len = 40
-                    filled = int(bar_len * completed / total) if total > 0 else bar_len
-                    bar = '#' * filled + '-' * (bar_len - filled)
-                    # 显示格式：在进度条左侧加入模式前缀
-                    line = f"{mode_prefix}进度: [{bar}] {pct:6.2f}% 可用用户: {available} (就绪:{ready_count})  未达标: {mismatched}"
-                    if debug:
-                        logging.info(line)
-                    else:
-                        # 非 debug 模式：只在控制台打印进度条（刷新）
-                        sys.stdout.write('\r' + line)
-                        sys.stdout.flush()
-                    # 计算用户级“被覆盖率”并得出全局抵抗率：
-                    # 抵抗率定义（按你的要求）：在所有用户中，统计其上次作画的像素是否被覆盖（若 snapshot 中任意像素与当前画板不同则视为被覆盖），
-                    # 抵抗率 = 被覆盖的用户数 / 总用户数 * 100%
+
+                    # 计算用户级“被覆盖率”并得出全局抵抗率
                     resistance_pct = None
                     user_covered = {}
                     try:
@@ -563,14 +551,12 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                             snap = user_last_snapshot.get(uid)
                             covered_flag = False
                             if snap and len(snap) > 0:
-                                # 若 snapshot 中存在任一像素与当前画板不一致，则认为该用户的上次作画被覆盖
                                 for pos, color in snap.items():
                                     cur = board_state.get(pos)
                                     if cur is None or cur != color:
                                         covered_flag = True
                                         break
                             else:
-                                # 无 snapshot 的用户视为未被覆盖（按定义只统计已有快照的覆盖情况）
                                 covered_flag = False
                             user_covered[uid] = covered_flag
                             if covered_flag:
@@ -582,6 +568,7 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                     except Exception:
                         resistance_pct = None
                         user_covered = {}
+
                     # 更新 GUI 状态
                     if gui_state is not None:
                         with gui_state['lock']:
@@ -591,14 +578,83 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                             gui_state['ready_count'] = ready_count
                             gui_state['resistance_pct'] = resistance_pct
                             gui_state['user_covered'] = user_covered
-                    # 在 CLI 中附加简短的抵抗率展示
+
+                    # 进度条文本与条形
+                    bar_len = 40
+                    filled = int(bar_len * completed / total) if total > 0 else bar_len
+                    bar = '#' * filled + '-' * (bar_len - filled)
+
+
+                    # maintain history and compute average growth over last window_seconds
+                    try:
+                        history.append((now, pct))
+                        # drop older than window
+                        while history and (now - history[0][0] > window_seconds):
+                            history.popleft()
+                        growth = None
+                        growth_str = ''
+                        eta_str = ''
+                        if len(history) >= 2:
+                            t0, p0 = history[0]
+                            t1, p1 = history[-1]
+                            dt = max(1e-6, t1 - t0)
+                            growth = (p1 - p0) / dt
+                        if growth is None:
+                            growth_str = '  增长: --'
+                        else:
+                            growth_str = f'  增长: {growth:+.2f}%/s'
+                            if growth > 1e-6:
+                                remain_pct = max(0.0, 100.0 - pct)
+                                eta_s = remain_pct / growth
+                                if eta_s >= 3600:
+                                    eta_str = f'  估计剩余: {int(eta_s//3600)}h{int((eta_s%3600)//60)}m'
+                                elif eta_s >= 60:
+                                    eta_str = f'  估计剩余: {int(eta_s//60)}m{int(eta_s%60)}s'
+                                else:
+                                    eta_str = f'  估计剩余: {int(eta_s)}s'
+                            else:
+                                if pct < 95.0:
+                                    eta_str = '  估计剩余: 我们正在被攻击，无法抵抗'
+                                else:
+                                    eta_str = '  估计剩余: 即将完成'
+                    except Exception:
+                        growth_str = '  增长: --'
+                        eta_str = ''
+
+                    # 判断危险状态：增长为负且进度小于95%
+                    danger = False
+                    try:
+                        if growth is not None and growth < 0 and pct < 95.0:
+                            danger = True
+                    except Exception:
+                        danger = False
+
+                    # 构造最终输出行，优先包含抵抗率与增长/ETA
                     try:
                         if resistance_pct is None:
-                            line = line + '  |  抵抗率: --'
+                            res_part = '  |  抵抗率: --'
                         else:
-                            line = line + f'  |  抵抗率: {resistance_pct:5.1f}%'
+                            res_part = f'  |  抵抗率: {resistance_pct:5.1f}%'
+                    except Exception:
+                        res_part = ''
+
+                    # 将输出行写到控制台；在危险时把进度条染为红色（ANSI）
+                    try:
+                        if danger:
+                            red = '\x1b[31m'
+                            reset = '\x1b[0m'
+                            colored_bar = red + '[' + bar + ']' + reset
+                            out_line = f"{mode_prefix}进度: {colored_bar} {pct:6.2f}% 可用用户: {available} (就绪:{ready_count})  未达标: {mismatched}{res_part}{growth_str}{eta_str}"
+                        else:
+                            out_line = f"{mode_prefix}进度: [{bar}] {pct:6.2f}% 可用用户: {available} (就绪:{ready_count})  未达标: {mismatched}{res_part}{growth_str}{eta_str}"
+                        if debug:
+                            logging.info(out_line)
+                        else:
+                            sys.stdout.write('\r' + out_line)
+                            sys.stdout.flush()
                     except Exception:
                         pass
+
                     # 若 GUI 请求停止则退出循环
                     if gui_state is not None and gui_state.get('stop'):
                         logging.info('收到 GUI 退出信号，结束调度循环。')
@@ -615,6 +671,24 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
             progress_task = asyncio.create_task(progress_printer())
 
             while True:
+                # 优先处理 GUI 请求的配置刷新（如图片路径、起点或模式被修改并调用 refresh_config）
+                if gui_state is not None and gui_state.get('reload_pixels'):
+                    try:
+                        with gui_state['lock']:
+                            gui_state['reload_pixels'] = False
+                        # 重新构建目标映射与绘制顺序
+                        target_map = tool.build_target_map(pixels, width, height, current_start_x, current_start_y)
+                        ordered_coords = tool.get_draw_order(current_draw_mode, width, height)
+                        target_positions = [(current_start_x + x, current_start_y + y) for x, y in ordered_coords if (current_start_x + x, current_start_y + y) in target_map]
+                        if gui_state is not None:
+                            with gui_state['lock']:
+                                gui_state['total'] = len(target_positions)
+                                # mismatched 将在下一次 progress_printer 计算，这里尽量同步
+                                gui_state['mismatched'] = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
+                        logging.info('已根据 GUI 请求刷新目标像素与绘制顺序。')
+                    except Exception:
+                        logging.exception('处理 GUI 刷新请求时出错')
+
                 # 检查 GUI 是否修改了绘制模式
                 if gui_state is not None:
                     with gui_state['lock']:
@@ -627,7 +701,7 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                 if new_mode != current_draw_mode:
                     logging.info(f"检测到模式切换: {current_draw_mode} -> {new_mode}，重新生成绘制顺序。")
                     current_draw_mode = new_mode
-                    ordered_coords = get_draw_order(current_draw_mode, width, height)
+                    ordered_coords = tool.get_draw_order(current_draw_mode, width, height)
                     target_positions = [(current_start_x + x, current_start_y + y) for x, y in ordered_coords if (current_start_x + x, current_start_y + y) in target_map]
                     if gui_state is not None:
                         with gui_state['lock']:
@@ -636,8 +710,8 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                 if (new_start_x, new_start_y) != (current_start_x, current_start_y):
                     logging.info(f"检测到起点变化: ({current_start_x},{current_start_y}) -> ({new_start_x},{new_start_y})，重建目标映射与绘制顺序。")
                     current_start_x, current_start_y = new_start_x, new_start_y
-                    target_map = build_target_map(pixels, width, height, current_start_x, current_start_y)
-                    ordered_coords = get_draw_order(current_draw_mode, width, height)
+                    target_map = tool.build_target_map(pixels, width, height, current_start_x, current_start_y)
+                    ordered_coords = tool.get_draw_order(current_draw_mode, width, height)
                     target_positions = [(current_start_x + x, current_start_y + y) for x, y in ordered_coords if (current_start_x + x, current_start_y + y) in target_map]
                     if gui_state is not None:
                         with gui_state['lock']:
@@ -664,7 +738,7 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
                         uid = user['uid']
                         token = user['token']
                         paint_id = user_counters[uid]
-                        await paint(ws, uid, token, r, g, b, x, y, paint_id)
+                        await tool.paint(ws, uid, token, r, g, b, x, y, paint_id)
                         # 记录 pending paint，待画板更新广播到来时归属成功绘制
                         try:
                             pending_paints.append({'uid': uid, 'paint_id': paint_id, 'pos': (x, y), 'color': (r, g, b), 'time': time.monotonic()})
@@ -727,7 +801,8 @@ async def handle_websocket(config, users_with_tokens, pixels, width, height, deb
             progress_task.cancel()
 
             # 等待发送队列清空
-            while paint_queue and not getattr(ws, "closed", False):
+            # paint_queue 已经被移到 tool.paint_queue 实现为模块全局
+            while getattr(tool, 'paint_queue', []) and not getattr(ws, "closed", False):
                 await asyncio.sleep(0.5)
 
             # 取消发送与接收任务
@@ -857,10 +932,53 @@ def main():
         if not cli_only:
             try:
                 # 动态导入 GUI 前端
-                from gui import start_gui as start_gui_func
+                import gui
+                start_gui_func = gui.start_gui
                 gui_available = True
             except Exception as e:
                 logging.warning(f"GUI 不可用，回退到 CLI：{e}")
+
+        # 定义刷新配置函数（仅刷新 image/pixels/start_x/start_y/draw_mode 等，不重新获取 token）
+        def refresh_config(new_cfg: dict):
+            """在不重新获取 token 的情况下刷新运行期配置并更新 GUI 状态。"""
+            try:
+                # 保存到文件
+                save_config(new_cfg)
+            except Exception:
+                logging.exception('保存配置失败')
+            # 更新内存中的 config 引用
+            nonlocal config, pixels, width, height
+            config.update(new_cfg)
+            # 重新加载图片像素（若图片路径改变）
+            try:
+                px, w, h = tool.load_image_pixels(config)
+                if px:
+                    pixels = px
+                    width = w
+                    height = h
+                    logging.info('已刷新目标图片与像素数据（未重新获取 Token）。')
+                else:
+                    logging.warning('刷新配置时未能加载图片，保持原有图片。')
+            except Exception:
+                logging.exception('刷新配置时加载图片失败')
+            # 如果 GUI 可用，更新 gui_state 的相关字段
+            try:
+                if gui_available:
+                    with gui_state['lock']:
+                        gui_state['start_x'] = int(config.get('start_x', gui_state.get('start_x', 0)))
+                        gui_state['start_y'] = int(config.get('start_y', gui_state.get('start_y', 0)))
+                        gui_state['draw_mode'] = config.get('draw_mode', gui_state.get('draw_mode'))
+                        # 通知后台任务重建 target_map
+                        gui_state['reload_pixels'] = True
+            except Exception:
+                logging.exception('刷新配置时更新 GUI 状态失败')
+
+        # 将刷新回调注册到 gui 模块（GUI 将调用此回调以替代重启）
+        try:
+            if gui_available:
+                gui.REFRESH_CALLBACK = refresh_config
+        except Exception:
+            pass
 
         if cli_only or not gui_available:
             # 保持原有 CLI 行为
