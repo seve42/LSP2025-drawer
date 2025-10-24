@@ -522,11 +522,20 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
 
             # 启动接收任务：处理 Ping(0xfc)、绘画结果(0xff)、画板更新(0xfa) 等
             async def receiver():
-                """接收并处理服务器消息，增强异常处理和心跳响应"""
+                """接收并处理服务器消息，增强异常处理和心跳响应
+                
+                改进：
+                - 更完善的异常捕获和分类处理
+                - 连续错误计数和自动退出
+                - 详细的错误日志
+                """
                 consecutive_errors = 0
                 max_consecutive_errors = 10
+                message_count = 0
+                
                 try:
                     async for message in ws:
+                        message_count += 1
                         try:
                             if isinstance(message, str):
                                 data = bytearray(message.encode())
@@ -541,8 +550,15 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                     try:
                                         await ws.send(bytes([0xfb]))
                                         consecutive_errors = 0  # 成功响应心跳后重置错误计数
+                                    except (websockets.exceptions.ConnectionClosed,
+                                            websockets.exceptions.ConnectionClosedError,
+                                            websockets.exceptions.ConnectionClosedOK) as e:
+                                        err_msg = str(e) if str(e) else e.__class__.__name__
+                                        logging.warning(f"响应 Pong 时连接已关闭: {err_msg}，接收任务退出。")
+                                        return
                                     except Exception as e:
-                                        logging.warning(f"响应 Pong 失败: {e}")
+                                        err_msg = str(e) if str(e) else e.__class__.__name__
+                                        logging.warning(f"响应 Pong 失败: {err_msg}")
                                         consecutive_errors += 1
                                         if consecutive_errors >= max_consecutive_errors:
                                             logging.error("心跳响应连续失败，接收任务退出。")
@@ -611,19 +627,37 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                         pass
                                 else:
                                     logging.warning(f"收到未知操作码: 0x{opcode:x}")
+                            
+                            # 成功处理消息后重置错误计数
+                            consecutive_errors = 0
+                            
                         except Exception as e:
-                            logging.warning(f"处理消息时出错: {e}")
+                            err_msg = str(e) if str(e) else e.__class__.__name__
+                            err_type = e.__class__.__name__
+                            logging.warning(f"处理消息时出错 ({err_type}): {err_msg}")
                             consecutive_errors += 1
                             if consecutive_errors >= max_consecutive_errors:
-                                logging.error("消息处理连续失败，接收任务退出。")
+                                logging.error(f"消息处理连续失败 {consecutive_errors} 次，接收任务退出。")
                                 break
-                except websockets.exceptions.ConnectionClosed as e:
-                    logging.info(f"WebSocket 连接已关闭: {e}")
+                    
+                    # 正常退出循环（连接关闭）
+                    logging.info(f"WebSocket 消息流结束（共接收 {message_count} 条消息），接收任务退出。")
+                    
+                except (websockets.exceptions.ConnectionClosed,
+                        websockets.exceptions.ConnectionClosedError,
+                        websockets.exceptions.ConnectionClosedOK) as e:
+                    err_msg = str(e) if str(e) else e.__class__.__name__
+                    logging.info(f"WebSocket 连接已关闭: {err_msg} (接收了 {message_count} 条消息)")
                 except asyncio.CancelledError:
                     # 任务被取消时正常退出
-                    pass
-                except Exception:
-                    logging.exception("WebSocket 接收处理时发生错误")
+                    logging.debug(f"接收任务被取消 (已接收 {message_count} 条消息)")
+                    raise
+                except Exception as e:
+                    err_msg = str(e) if str(e) else e.__class__.__name__
+                    err_type = e.__class__.__name__
+                    logging.exception(f"WebSocket 接收处理时发生未预期异常 ({err_type}): {err_msg}")
+                finally:
+                    logging.info("接收任务已退出。")
 
             receiver_task = asyncio.create_task(receiver())
 
@@ -820,87 +854,124 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
 
             # 健康检查：定期验证连接和任务状态
             last_health_check = time.monotonic()
-            health_check_interval = 30  # 每30秒检查一次
+            health_check_interval = 10  # 每10秒进行一次完整健康检查
+            last_task_check = time.monotonic()
+            task_check_interval = 2  # 每2秒快速检查任务状态
             
             while True:
-                # 若连接已关闭，则退出以便外层重连
-                try:
-                    is_open = getattr(ws, "open", None)
-                    if is_open is None:
-                        is_open = not getattr(ws, "closed", False)
-                except Exception:
-                    is_open = False
-                    
-                # 定期健康检查
                 now = time.monotonic()
-                if now - last_health_check >= health_check_interval:
-                    last_health_check = now
-                    if not is_open:
-                        logging.warning("健康检查：检测到 WebSocket 已关闭，退出以便重连。")
-                        # 立即取消所有后台任务
-                        progress_task.cancel()
-                        sender_task.cancel()
-                        receiver_task.cancel()
-                        break
-                    # 检查发送和接收任务状态
+                
+                # 快速任务状态检查（每2秒）- 优先检测任务退出
+                if now - last_task_check >= task_check_interval:
+                    last_task_check = now
+                    connection_issue = False
+                    
+                    # 检查发送任务状态
                     try:
                         if sender_task.done():
-                            exc = sender_task.exception() if not sender_task.cancelled() else None
-                            if exc:
-                                logging.error(f"发送任务异常退出: {exc}")
-                            else:
-                                logging.warning("发送任务已退出")
-                            # 立即取消所有后台任务
-                            progress_task.cancel()
-                            sender_task.cancel()
-                            receiver_task.cancel()
-                            break
-                    except Exception:
-                        pass
+                            try:
+                                exc = sender_task.exception() if not sender_task.cancelled() else None
+                                if exc:
+                                    logging.error(f"发送任务异常退出: {exc}")
+                                else:
+                                    logging.warning("发送任务已正常退出，可能由于连接问题")
+                            except Exception as e:
+                                logging.warning(f"发送任务已退出: {e}")
+                            connection_issue = True
+                    except Exception as e:
+                        logging.debug(f"检查发送任务状态时出错: {e}")
+                    
+                    # 检查接收任务状态
                     try:
                         if receiver_task.done():
-                            exc = receiver_task.exception() if not receiver_task.cancelled() else None
-                            if exc:
-                                logging.error(f"接收任务异常退出: {exc}")
-                            else:
-                                logging.warning("接收任务已退出")
-                            # 立即取消所有后台任务
+                            try:
+                                exc = receiver_task.exception() if not receiver_task.cancelled() else None
+                                if exc:
+                                    logging.error(f"接收任务异常退出: {exc}")
+                                else:
+                                    logging.warning("接收任务已正常退出，可能由于连接问题")
+                            except Exception as e:
+                                logging.warning(f"接收任务已退出: {e}")
+                            connection_issue = True
+                    except Exception as e:
+                        logging.debug(f"检查接收任务状态时出错: {e}")
+                    
+                    # 检查连接状态
+                    try:
+                        is_open = getattr(ws, "open", None)
+                        if is_open is None:
+                            is_open = not getattr(ws, "closed", False)
+                        if not is_open:
+                            logging.warning("检测到 WebSocket 已关闭")
+                            connection_issue = True
+                    except Exception as e:
+                        logging.debug(f"检查连接状态时出错: {e}")
+                        connection_issue = True
+                    
+                    # 如果检测到连接问题，立即清理并退出
+                    if connection_issue:
+                        logging.warning("检测到连接异常，退出当前循环以便重连。")
+                        try:
                             progress_task.cancel()
                             sender_task.cancel()
                             receiver_task.cancel()
-                            break
-                    except Exception:
-                        pass
-                    logging.debug(f"健康检查通过：连接正常，发送/接收任务运行中")
+                            # 等待任务取消完成
+                            await asyncio.wait_for(
+                                asyncio.gather(progress_task, sender_task, receiver_task, return_exceptions=True),
+                                timeout=2.0
+                            )
+                        except asyncio.TimeoutError:
+                            logging.debug("等待任务取消超时")
+                        except Exception as e:
+                            logging.debug(f"取消任务时出错: {e}")
+                        break
                 
-                # 快速检查任务状态（不记录，只用于快速退出）
-                try:
-                    if sender_task.done():
-                        logging.warning("检测到发送任务已退出，连接可能异常，退出当前循环以便重连。")
-                        # 立即取消所有后台任务
-                        progress_task.cancel()
-                        sender_task.cancel()
-                        receiver_task.cancel()
+                # 完整健康检查（每10秒）- 包含详细日志
+                if now - last_health_check >= health_check_interval:
+                    last_health_check = now
+                    
+                    # 检查连接状态
+                    try:
+                        is_open = getattr(ws, "open", None)
+                        if is_open is None:
+                            is_open = not getattr(ws, "closed", False)
+                    except Exception:
+                        is_open = False
+                    
+                    if not is_open:
+                        logging.warning("健康检查：检测到 WebSocket 已关闭，退出以便重连。")
+                        try:
+                            progress_task.cancel()
+                            sender_task.cancel()
+                            receiver_task.cancel()
+                            await asyncio.wait_for(
+                                asyncio.gather(progress_task, sender_task, receiver_task, return_exceptions=True),
+                                timeout=2.0
+                            )
+                        except:
+                            pass
                         break
-                except Exception:
-                    pass
-                try:
-                    if receiver_task.done():
-                        logging.warning("检测到接收任务已退出，连接可能异常，退出当前循环以便重连。")
-                        # 立即取消所有后台任务
-                        progress_task.cancel()
-                        sender_task.cancel()
-                        receiver_task.cancel()
+                    
+                    # 检查任务健康状态
+                    sender_ok = not sender_task.done()
+                    receiver_ok = not receiver_task.done()
+                    progress_ok = not progress_task.done()
+                    
+                    if not sender_ok or not receiver_ok or not progress_ok:
+                        logging.warning(f"健康检查：任务状态异常 [发送:{sender_ok} 接收:{receiver_ok} 进度:{progress_ok}]，退出以便重连。")
+                        try:
+                            progress_task.cancel()
+                            sender_task.cancel()
+                            receiver_task.cancel()
+                            await asyncio.wait_for(
+                                asyncio.gather(progress_task, sender_task, receiver_task, return_exceptions=True),
+                                timeout=2.0
+                            )
+                        except:
+                            pass
                         break
-                except Exception:
-                    pass
-                if not is_open:
-                    logging.warning("检测到 WebSocket 已关闭，退出当前循环以便重连。")
-                    # 立即取消所有后台任务
-                    progress_task.cancel()
-                    sender_task.cancel()
-                    receiver_task.cancel()
-                    break
+                    
+                    logging.debug(f"健康检查通过：连接正常，所有任务运行中")
                 # 优先处理 GUI 请求的配置刷新（如图片路径、起点或模式被修改并调用 refresh_config）
                 if gui_state is not None and gui_state.get('reload_pixels'):
                     try:
@@ -1117,12 +1188,15 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
     优化：
     - 更智能的退避策略
     - 连接成功后重置退避
-    - 详细的重连日志
+    - 详细的重连日志和诊断信息
+    - 统计连接质量指标
     """
     backoff = 1.0
     backoff_max = 60.0
     reconnect_count = 0
     last_successful_duration = 0
+    total_connected_time = 0.0
+    successful_connections = 0
     
     while True:
         # GUI 请求停止则退出
@@ -1130,28 +1204,57 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
             logging.info('检测到停止标记，结束 run_forever 循环。')
             break
         reconnect_count += 1
+        connection_start = time.monotonic()
+        exit_reason = "未知原因"
+        
         try:
-            logging.info(f"{'初始' if reconnect_count == 1 else '重'}连接 WebSocket (第 {reconnect_count} 次)...")
+            if reconnect_count == 1:
+                logging.info(f"初始连接 WebSocket...")
+            else:
+                logging.info(f"尝试重新连接 WebSocket (第 {reconnect_count} 次尝试，累计成功连接: {successful_connections} 次，总连接时长: {total_connected_time:.1f}s)...")
+            
             duration = await handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state)
             last_successful_duration = duration if isinstance(duration, (int, float)) else 0
             
+            # 统计成功连接
+            if last_successful_duration > 0:
+                successful_connections += 1
+                total_connected_time += last_successful_duration
+            
             # 若自然返回且未设置停止，视为异常退出，进入重连
             if gui_state is not None and gui_state.get('stop'):
+                exit_reason = "用户停止"
                 break
-            logging.warning(f'主循环意外结束（运行时长: {duration:.1f}s），将在短暂等待后尝试重连。')
             
-            # 若本次连接持续了一段时间（例如 >=60s），认为连接稳定，重置退避和计数
-            try:
-                if isinstance(duration, (int, float)) and duration >= 60.0:
+            exit_reason = "主循环正常退出"
+            
+            # 分析连接质量并调整重连策略
+            if isinstance(duration, (int, float)):
+                if duration >= 60.0:
+                    # 连接稳定超过1分钟，认为网络质量良好
                     backoff = 1.0
                     reconnect_count = 0
-                    logging.info(f'连接持续时间较长({duration:.1f}s)，已重置重连退避和计数。')
-                elif isinstance(duration, (int, float)) and duration >= 30.0:
-                    # 部分重置退避
+                    avg_duration = total_connected_time / successful_connections if successful_connections > 0 else 0
+                    logging.info(f'连接持续时间较长({duration:.1f}s)，网络质量良好。平均连接时长: {avg_duration:.1f}s，已重置重连退避。')
+                elif duration >= 30.0:
+                    # 连接持续30-60秒，部分稳定
                     backoff = max(1.0, backoff / 2)
                     logging.info(f'连接持续时间中等({duration:.1f}s)，已降低重连退避至 {backoff:.1f}s。')
-            except Exception:
-                pass
+                elif duration >= 10.0:
+                    # 连接持续10-30秒，网络不稳定
+                    backoff = min(backoff * 1.5, backoff_max)
+                    logging.warning(f'连接持续时间较短({duration:.1f}s)，网络可能不稳定，退避增加至 {backoff:.1f}s。')
+                else:
+                    # 连接持续不到10秒，网络很不稳定或服务器限制
+                    backoff = min(backoff * 2.0, backoff_max)
+                    logging.warning(f'连接持续时间很短({duration:.1f}s)，可能遇到连接限制或严重网络问题，退避增加至 {backoff:.1f}s。')
+                
+                # 计算连接稳定性评分 (0-100)
+                stability_score = min(100, (duration / 300.0) * 100) if duration > 0 else 0
+                logging.info(f'本次连接稳定性评分: {stability_score:.1f}/100')
+            
+            logging.warning(f'主循环意外结束（运行时长: {last_successful_duration:.1f}s，原因: {exit_reason}），将在短暂等待后尝试重连。')
+            
         except (websockets.exceptions.ConnectionClosedError,
                 websockets.exceptions.ConnectionClosedOK,
                 websockets.exceptions.InvalidStatusCode,
@@ -1159,28 +1262,66 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
                 asyncio.TimeoutError) as e:
             # 某些异常的 str 可能为空，补充类型名便于诊断
             err_text = str(e) or e.__class__.__name__
-            logging.warning(f'连接中断或超时 (第 {reconnect_count} 次)：{err_text}，准备重连。')
-            # 网络相关异常，适度增加退避
-            if last_successful_duration >= 10.0:
-                # 如果之前连接稳定过，使用较小的退避增长
-                backoff = min(backoff * 1.5, backoff_max)
-            else:
+            err_type = e.__class__.__name__
+            connection_duration = time.monotonic() - connection_start
+            
+            # 详细分类错误类型
+            if isinstance(e, websockets.exceptions.InvalidStatusCode):
+                exit_reason = f"服务器返回异常状态码: {err_text}"
+                logging.warning(f'{exit_reason} (第 {reconnect_count} 次尝试，已连接 {connection_duration:.1f}s)')
+                # 状态码错误可能是服务器限制，使用较大退避
+                backoff = min(backoff * 2.5, backoff_max)
+            elif isinstance(e, asyncio.TimeoutError):
+                exit_reason = "连接超时"
+                logging.warning(f'{exit_reason} (第 {reconnect_count} 次尝试，已连接 {connection_duration:.1f}s)')
+                # 超时可能是网络问题，适度退避
+                backoff = min(backoff * 1.8, backoff_max)
+            elif isinstance(e, OSError):
+                exit_reason = f"操作系统网络错误: {err_text}"
+                logging.warning(f'{exit_reason} (第 {reconnect_count} 次尝试，已连接 {connection_duration:.1f}s)')
+                # OS错误通常是严重网络问题，使用较大退避
                 backoff = min(backoff * 2.0, backoff_max)
+            else:
+                exit_reason = f"连接异常关闭: {err_text}"
+                logging.warning(f'{exit_reason} (第 {reconnect_count} 次尝试，已连接 {connection_duration:.1f}s)')
+                # 网络相关异常，根据之前的连接时长调整
+                if last_successful_duration >= 10.0:
+                    backoff = min(backoff * 1.5, backoff_max)
+                else:
+                    backoff = min(backoff * 2.0, backoff_max)
+                    
         except Exception as e:
-            logging.exception(f'运行过程中出现未预期异常 (第 {reconnect_count} 次)，准备重连。')
+            err_text = str(e) or e.__class__.__name__
+            err_type = e.__class__.__name__
+            connection_duration = time.monotonic() - connection_start
+            exit_reason = f"未预期异常 ({err_type}): {err_text}"
+            logging.exception(f'运行过程中出现未预期异常 (第 {reconnect_count} 次尝试，已连接 {connection_duration:.1f}s)，准备重连。')
             # 未预期异常，使用较大的退避
             backoff = min(backoff * 2.5, backoff_max)
 
         # 指数回退的等待；等待期间可响应停止
         wait_left = backoff
-        logging.info(f'将在 {wait_left:.1f}s 后进行第 {reconnect_count + 1} 次重连尝试 (累计重连: {reconnect_count} 次)。')
+        if reconnect_count == 1:
+            logging.info(f'将在 {wait_left:.1f}s 后进行首次重连。退出原因: {exit_reason}')
+        else:
+            # 计算预计下次连接的稳定性
+            avg_duration = total_connected_time / successful_connections if successful_connections > 0 else 0
+            logging.info(f'将在 {wait_left:.1f}s 后进行第 {reconnect_count + 1} 次重连尝试。')
+            logging.info(f'连接统计 - 成功: {successful_connections} 次，平均时长: {avg_duration:.1f}s，退出原因: {exit_reason}')
+        
         while wait_left > 0:
             if gui_state is not None and gui_state.get('stop'):
                 logging.info('检测到停止标记，放弃重连等待。')
                 return
             await asyncio.sleep(min(1.0, wait_left))
             wait_left -= 1.0
-    logging.info('run_forever 正常退出。')
+    
+    # 输出最终统计
+    if successful_connections > 0:
+        avg_duration = total_connected_time / successful_connections
+        logging.info(f'run_forever 退出。总连接次数: {successful_connections}，总时长: {total_connected_time:.1f}s，平均时长: {avg_duration:.1f}s')
+    else:
+        logging.info('run_forever 正常退出（无成功连接）。')
 
 
 def main():

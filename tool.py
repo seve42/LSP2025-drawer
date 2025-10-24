@@ -64,77 +64,104 @@ async def send_paint_data(ws, interval_ms):
     - 更健壮的连接状态检查
     - 更完善的异常处理和数据保护
     - 连续错误时自动退出以便重连
+    - 捕获所有可能的 WebSocket 异常
     """
     consecutive_errors = 0
     max_consecutive_errors = 5
     
-    while True:
-        await asyncio.sleep(interval_ms / 1000.0)
-        
-        # 更健壮的连接状态检查
-        try:
-            is_open = getattr(ws, "open", None)
-            if is_open is None:
-                is_open = not getattr(ws, "closed", False)
-        except Exception:
-            is_open = False
+    try:
+        while True:
+            await asyncio.sleep(interval_ms / 1000.0)
             
-        if not is_open:
-            # 连接已关闭，保留队列数据并退出
-            logging.warning("检测到连接已关闭，发送任务退出以便重连。")
-            break
-            
-        if paint_queue:
-            merged_data = get_merged_data()
-            if merged_data:
-                try:
-                    await ws.send(merged_data)
-                    logging.debug(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
-                    consecutive_errors = 0  # 成功后重置错误计数
-                except (websockets.exceptions.ConnectionClosed, 
-                        websockets.exceptions.ConnectionClosedError, 
-                        websockets.exceptions.ConnectionClosedOK) as e:
-                    # 连接已关闭，将数据重新入队并退出，交由上层重连逻辑处理
-                    logging.warning(f"发送数据时连接已关闭: {e}; 重新入队数据并退出发送任务。")
-                    try:
-                        append_to_queue(merged_data)
-                    except Exception:
-                        # 如果 append 失败，则放到全局 paint_queue 保底
-                        try:
-                            paint_queue.insert(0, merged_data)
-                        except Exception:
-                            pass
-                    break
-                except asyncio.TimeoutError as e:
-                    # 发送超时，重新入队并计数
-                    logging.warning(f"发送数据超时: {e}; 重新入队数据。")
-                    consecutive_errors += 1
-                    try:
-                        append_to_queue(merged_data)
-                    except Exception:
-                        try:
-                            paint_queue.insert(0, merged_data)
-                        except Exception:
-                            pass
-                    await asyncio.sleep(1.0)
-                except Exception as e:
-                    # 其它异常：记录并将数据重入队
-                    logging.error(f"发送数据时出错: {e}")
-                    consecutive_errors += 1
-                    try:
-                        append_to_queue(merged_data)
-                    except Exception:
-                        try:
-                            paint_queue.insert(0, merged_data)
-                        except Exception:
-                            pass
-                    # 避免快速循环重试造成 CPU 飙升
-                    await asyncio.sleep(1.0)
+            # 更健壮的连接状态检查
+            try:
+                is_open = getattr(ws, "open", None)
+                if is_open is None:
+                    is_open = not getattr(ws, "closed", False)
+            except Exception:
+                is_open = False
                 
-                # 连续错误过多时退出，让上层重连
-                if consecutive_errors >= max_consecutive_errors:
-                    logging.error(f"连续发送失败 {consecutive_errors} 次，发送任务退出以便重连。")
-                    break
+            if not is_open:
+                # 连接已关闭，保留队列数据并退出
+                logging.warning("检测到连接已关闭，发送任务退出以便重连。")
+                break
+                
+            if paint_queue:
+                merged_data = get_merged_data()
+                if merged_data:
+                    try:
+                        await ws.send(merged_data)
+                        logging.debug(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
+                        consecutive_errors = 0  # 成功后重置错误计数
+                    except (websockets.exceptions.ConnectionClosed, 
+                            websockets.exceptions.ConnectionClosedError, 
+                            websockets.exceptions.ConnectionClosedOK) as e:
+                        # 连接已关闭，将数据重新入队并退出，交由上层重连逻辑处理
+                        err_msg = str(e) if str(e) else e.__class__.__name__
+                        logging.warning(f"发送数据时连接已关闭: {err_msg}; 重新入队数据并退出发送任务。")
+                        try:
+                            append_to_queue(merged_data)
+                        except Exception as re_queue_err:
+                            # 如果 append 失败，则放到全局 paint_queue 保底
+                            logging.debug(f"重新入队时出错: {re_queue_err}，尝试直接插入队列")
+                            try:
+                                paint_queue.insert(0, merged_data)
+                            except Exception as insert_err:
+                                logging.warning(f"无法保存待发送数据: {insert_err}")
+                        break
+                    except asyncio.TimeoutError as e:
+                        # 发送超时，重新入队并计数
+                        logging.warning(f"发送数据超时: {e}; 重新入队数据。")
+                        consecutive_errors += 1
+                        try:
+                            append_to_queue(merged_data)
+                        except Exception:
+                            try:
+                                paint_queue.insert(0, merged_data)
+                            except Exception:
+                                pass
+                        await asyncio.sleep(1.0)
+                    except asyncio.CancelledError:
+                        # 任务被取消，重新入队数据并退出
+                        logging.info("发送任务被取消，重新入队数据。")
+                        try:
+                            append_to_queue(merged_data)
+                        except Exception:
+                            try:
+                                paint_queue.insert(0, merged_data)
+                            except Exception:
+                                pass
+                        raise
+                    except Exception as e:
+                        # 其它异常：记录并将数据重入队
+                        err_msg = str(e) if str(e) else e.__class__.__name__
+                        err_type = e.__class__.__name__
+                        logging.error(f"发送数据时出错 ({err_type}): {err_msg}")
+                        consecutive_errors += 1
+                        try:
+                            append_to_queue(merged_data)
+                        except Exception:
+                            try:
+                                paint_queue.insert(0, merged_data)
+                            except Exception:
+                                pass
+                        # 避免快速循环重试造成 CPU 飙升
+                        await asyncio.sleep(1.0)
+                    
+                    # 连续错误过多时退出，让上层重连
+                    if consecutive_errors >= max_consecutive_errors:
+                        logging.error(f"连续发送失败 {consecutive_errors} 次，发送任务退出以便重连。")
+                        break
+    except asyncio.CancelledError:
+        # 任务被取消时正常退出
+        logging.debug("发送任务被取消。")
+        raise
+    except Exception as e:
+        # 捕获任何未预期的异常，避免任务静默失败
+        err_msg = str(e) if str(e) else e.__class__.__name__
+        logging.error(f"发送任务遇到未预期异常: {err_msg}，任务退出。")
+    finally:
+        logging.info("发送任务已退出。")
 
 
 def build_target_map(pixels, width, height, start_x, start_y, config=None):
