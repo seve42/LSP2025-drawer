@@ -485,12 +485,13 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         # 限制握手与关闭超时，避免卡住；部分环境下可减轻“opening handshake 超时”的长期滞留
         async with websockets.connect(
             WS_URL,
-            ping_interval=30,
-            ping_timeout=60,
-            open_timeout=15,
+            ping_interval=15,      # 每15秒发送一次 ping（更频繁，避免服务器超时断开）
+            ping_timeout=45,       # 45秒超时（更宽松，适应网络波动）
+            open_timeout=20,       # 增加握手超时到20秒
             close_timeout=10,
+            max_size=10 * 1024 * 1024,  # 10MB 消息大小限制
         ) as ws:
-            logging.info("WebSocket 连接已打开。")
+            logging.info("WebSocket 连接已建立（心跳优化: ping间隔=15s）")
             # 新连接建立时清空待发送队列，避免残留数据
             try:
                 tool.paint_queue.clear()
