@@ -837,6 +837,10 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     last_health_check = now
                     if not is_open:
                         logging.warning("健康检查：检测到 WebSocket 已关闭，退出以便重连。")
+                        # 立即取消所有后台任务
+                        progress_task.cancel()
+                        sender_task.cancel()
+                        receiver_task.cancel()
                         break
                     # 检查发送和接收任务状态
                     try:
@@ -846,6 +850,10 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                 logging.error(f"发送任务异常退出: {exc}")
                             else:
                                 logging.warning("发送任务已退出")
+                            # 立即取消所有后台任务
+                            progress_task.cancel()
+                            sender_task.cancel()
+                            receiver_task.cancel()
                             break
                     except Exception:
                         pass
@@ -856,6 +864,10 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                 logging.error(f"接收任务异常退出: {exc}")
                             else:
                                 logging.warning("接收任务已退出")
+                            # 立即取消所有后台任务
+                            progress_task.cancel()
+                            sender_task.cancel()
+                            receiver_task.cancel()
                             break
                     except Exception:
                         pass
@@ -865,17 +877,29 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                 try:
                     if sender_task.done():
                         logging.warning("检测到发送任务已退出，连接可能异常，退出当前循环以便重连。")
+                        # 立即取消所有后台任务
+                        progress_task.cancel()
+                        sender_task.cancel()
+                        receiver_task.cancel()
                         break
                 except Exception:
                     pass
                 try:
                     if receiver_task.done():
                         logging.warning("检测到接收任务已退出，连接可能异常，退出当前循环以便重连。")
+                        # 立即取消所有后台任务
+                        progress_task.cancel()
+                        sender_task.cancel()
+                        receiver_task.cancel()
                         break
                 except Exception:
                     pass
                 if not is_open:
                     logging.warning("检测到 WebSocket 已关闭，退出当前循环以便重连。")
+                    # 立即取消所有后台任务
+                    progress_task.cancel()
+                    sender_task.cancel()
+                    receiver_task.cancel()
                     break
                 # 优先处理 GUI 请求的配置刷新（如图片路径、起点或模式被修改并调用 refresh_config）
                 if gui_state is not None and gui_state.get('reload_pixels'):
@@ -917,6 +941,10 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                 # 若 GUI 模式要求停止，退出循环
                 if gui_state is not None and gui_state.get('stop'):
                     logging.info('收到 GUI 退出信号，结束主循环。')
+                    # 立即取消所有后台任务
+                    progress_task.cancel()
+                    sender_task.cancel()
+                    receiver_task.cancel()
                     break
                 now = time.monotonic()
                 # 未达目标色（未知状态也视为未完成）
@@ -1043,17 +1071,30 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             # 不再退出，理论上保持在 while True；若意外跳出则继续走到发送清空
             logging.info("调度循环结束（意外），等待剩余数据发送...")
 
-            # 取消进度任务
-            progress_task.cancel()
+            # 确保所有后台任务都被取消（如果还没被取消）
+            if not progress_task.cancelled():
+                progress_task.cancel()
+            if not sender_task.cancelled():
+                sender_task.cancel()
+            if not receiver_task.cancelled():
+                receiver_task.cancel()
+
+            # 等待任务完全退出（最多等待1秒）
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(progress_task, sender_task, receiver_task, return_exceptions=True),
+                    timeout=1.0
+                )
+            except asyncio.TimeoutError:
+                logging.warning("等待后台任务退出超时，但继续清理")
+            except Exception:
+                pass
 
             # 等待发送队列清空
             # paint_queue 已经被移到 tool.paint_queue 实现为模块全局
             while getattr(tool, 'paint_queue', []) and not getattr(ws, "closed", False):
                 await asyncio.sleep(0.5)
 
-            # 取消发送与接收任务
-            sender_task.cancel()
-            receiver_task.cancel()
             logging.info("所有数据已发送/处理，准备关闭连接。")
     finally:
         # 恢复之前的环境变量（如果有）
