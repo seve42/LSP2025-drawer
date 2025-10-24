@@ -251,6 +251,10 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
 
     lbl_info = ttk.Label(info_frame, text="", wraplength=450, justify=tk.LEFT)
     lbl_info.pack(fill=tk.X, pady=2, padx=5)
+    
+    # 连接状态标签
+    conn_status_lbl = ttk.Label(info_frame, text='🟢 连接正常', anchor='w', foreground='green')
+    conn_status_lbl.pack(fill=tk.X, pady=1, padx=5)
 
     # 可用/就绪用户展示
     users_lbl = ttk.Label(info_frame, text='可用: 0 | 就绪: 0', anchor='w', foreground='blue')
@@ -609,7 +613,19 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             gui_state['overlay'] = v
         redraw()
 
+    def request_reload():
+        """请求重载连接"""
+        result = messagebox.askyesno(
+            "重启程序",
+            "确定要重启程序吗？\n\n这将：\n• 完全退出当前进程\n• 重新启动程序\n• 重新初始化所有连接\n• Token会被保留（如果未过期）\n\n这是最可靠的恢复方式。"
+        )
+        if result:
+            with gui_state['lock']:
+                gui_state['reload_requested'] = True
+            messagebox.showinfo("重启请求", "程序将在短时间内重启。")
+
     ttk.Button(ctrl_btn_frame, text='👁️ 预览成果', command=toggle_overlay).pack(side=tk.LEFT, padx=2)
+    ttk.Button(ctrl_btn_frame, text='🔄 重启程序', command=request_reload).pack(side=tk.LEFT, padx=2)
     
     # 拖动设置起点功能
     def open_drag_window():
@@ -957,6 +973,19 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             ready = int(gui_state.get('ready_count', 0))
             resistance_pct = gui_state.get('resistance_pct', None)
             num_images = len(gui_state.get('images_data', []))
+            reload_requested = gui_state.get('reload_requested', False)
+            connection_active = gui_state.get('connection_active', True)  # 新增：连接活跃状态
+
+        # 更新连接状态显示
+        try:
+            if reload_requested:
+                conn_status_lbl.config(text='� 重启中...', foreground='orange')
+            elif not connection_active:
+                conn_status_lbl.config(text='🔴 连接断开', foreground='red')
+            else:
+                conn_status_lbl.config(text='🟢 连接正常', foreground='green')
+        except Exception:
+            pass
 
         pct = 100.0 if total <= 0 else max(0.0, min(100.0, (total - mismatched) * 100.0 / max(1, total)))
         progress_var.set(pct)

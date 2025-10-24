@@ -14,6 +14,15 @@ import tool
 import threading
 from collections import OrderedDict, deque
 
+# 导入多连接支持模块
+try:
+    import multi_conn_patch
+    USE_MULTI_CONN = True
+    logging.info("多连接模块已加载")
+except ImportError:
+    USE_MULTI_CONN = False
+    logging.warning("多连接模块未找到，将使用单连接模式")
+
 # --- 全局配置 ---
 API_BASE_URL = "https://paintboard.luogu.me"
 WS_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
@@ -44,80 +53,6 @@ def save_config(config: dict):
         logging.info("配置已保存到 config.json")
     except Exception:
         logging.exception("保存配置失败")
-
-def append_to_queue(paint_data):
-    """将绘画数据添加到粘包队列"""
-    global paint_queue, total_size
-    paint_queue.append(paint_data)
-    total_size += len(paint_data)
-
-def get_merged_data():
-    """合并队列中的所有数据块"""
-    global paint_queue, total_size
-    if not paint_queue:
-        return None
-    
-    merged = bytearray(total_size)
-    offset = 0
-    for chunk in paint_queue:
-        merged[offset:offset + len(chunk)] = chunk
-        offset += len(chunk)
-    
-    paint_queue = []
-    total_size = 0
-    return merged
-
-async def paint(ws, uid, token, r, g, b, x, y, paint_id):
-    """准备绘画数据并加入队列"""
-    try:
-        # token 可能带或不带短横线，UUID 构造器对不同格式略敏感，做兼容处理
-        try:
-            token_bytes = UUID(token).bytes
-        except Exception:
-            # 试着移除短横线后以 hex 形式构造
-            try:
-                token_bytes = UUID(hex=token.replace('-', '')).bytes
-            except Exception as e:
-                logging.error(f"无效的 Token 格式: {token}，创建 UUID 失败: {e}")
-                return
-        # 构造绘画数据包
-        # 操作码 (1) + x (2) + y (2) + rgb (3) + uid (3) + token (16) + id (4) = 31 字节
-        paint_data = bytearray(31)
-        paint_data[0] = 0xfe  # 操作码
-        paint_data[1:3] = x.to_bytes(2, 'little')
-        paint_data[3:5] = y.to_bytes(2, 'little')
-        paint_data[5:8] = [r, g, b]
-        paint_data[8:11] = uid.to_bytes(3, 'little')
-        paint_data[11:27] = token_bytes
-        paint_data[27:31] = paint_id.to_bytes(4, 'little')
-        
-        append_to_queue(paint_data)
-    except Exception as e:
-        logging.error(f"创建绘画数据时出错: {e}")
-
-async def send_paint_data(ws, interval_ms):
-    """定时发送粘合后的绘画数据包"""
-    while True:
-        await asyncio.sleep(interval_ms / 1000.0)
-        # websockets 新旧 API 兼容：优先使用 ws.open，否则使用 not ws.closed
-        try:
-            is_open = getattr(ws, "open", None)
-            if is_open is None:
-                is_open = not getattr(ws, "closed", False)
-        except Exception:
-            is_open = False
-
-        if is_open and paint_queue:
-            merged_data = get_merged_data()
-            if merged_data:
-                try:
-                    await ws.send(merged_data)
-                    logging.debug(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
-                except websockets.ConnectionClosed:
-                    logging.warning("发送数据时 WebSocket 连接已关闭。")
-                    break
-                except Exception as e:
-                    logging.error(f"发送数据时出错: {e}")
 
 def build_target_map(pixels, width, height, start_x, start_y, config=None):
     """构建目标像素颜色映射：{(abs_x,abs_y): (r,g,b)}，跳过透明与越界。
@@ -421,13 +356,51 @@ def get_token(uid: int, access_key: str):
             os.environ.update(_saved_env)
 
 
-async def handle_websocket(config, users_with_tokens, images_data, debug=False, gui_state=None):
-    """主 WebSocket 处理函数
+async def handle_single_websocket(ws, conn_id, config, board_state, state_changed_event, gui_state=None):
+    """处理单个 WebSocket 连接的发送任务
+    
+    Args:
+        ws: WebSocket 连接对象
+        conn_id: 连接 ID
+        config: 配置字典
+        board_state: 画板状态字典（共享）
+        state_changed_event: 状态改变事件（共享）
+        gui_state: GUI 状态对象（可选）
+    """
+    paint_interval_ms = config.get("paint_interval_ms", 20)
+    
+    # 初始化该连接的队列
+    tool.init_connection_queue(conn_id)
+    
+    # 启动定时发送任务（粘包）
+    sender_task = asyncio.create_task(tool.send_paint_data(ws, paint_interval_ms, conn_id))
+    
+    try:
+        # 只写连接不需要接收消息（只发送绘画数据）
+        # 等待发送任务完成或连接关闭
+        await sender_task
+    except asyncio.CancelledError:
+        logging.debug(f"连接 {conn_id} 的处理任务被取消")
+        sender_task.cancel()
+        raise
+    except Exception as e:
+        logging.error(f"连接 {conn_id} 处理时出错: {e}")
+    finally:
+        if not sender_task.done():
+            sender_task.cancel()
+            try:
+                await sender_task
+            except:
+                pass
 
-    修复点：
-    - 将发送/绘制/接收全部放入 WebSocket 上下文中，确保连接在任务期间保持打开。
-    - 并发接收服务端消息，及时应答 0xfc 心跳为 0xfb，避免被断开。
-    - 支持多图片绘制，合并目标映射并按权重处理重叠
+
+async def handle_websocket(config, users_with_tokens, images_data, debug=False, gui_state=None):
+    """主 WebSocket 处理函数 - 支持多连接
+
+    改进点：
+    - 建立多个只写 WebSocket 连接（最多 5 个）以提升稳定性和吞吐量
+    - 保留一个读写连接用于接收画板更新和心跳
+    - 在多个连接间均衡分配绘画任务
     """
     paint_interval_ms = config.get("paint_interval_ms", 20)
     round_interval_seconds = config.get("round_interval_seconds", 30)
@@ -491,6 +464,12 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             close_timeout=10,
         ) as ws:
             logging.info("WebSocket 连接已打开。")
+            
+            # 更新连接状态为活跃
+            if gui_state is not None:
+                with gui_state['lock']:
+                    gui_state['connection_active'] = True
+            
             # 新连接建立时清空待发送队列，避免残留数据
             try:
                 tool.paint_queue.clear()
@@ -924,6 +903,13 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                             logging.debug("等待任务取消超时")
                         except Exception as e:
                             logging.debug(f"取消任务时出错: {e}")
+                        
+                        # 设置重载标志以立即重连（而非等待退避）
+                        if gui_state is not None:
+                            with gui_state['lock']:
+                                gui_state['reload_requested'] = True
+                                gui_state['connection_active'] = False  # 标记连接断开
+                        
                         break
                 
                 # 完整健康检查（每10秒）- 包含详细日志
@@ -940,6 +926,11 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     
                     if not is_open:
                         logging.warning("健康检查：检测到 WebSocket 已关闭，退出以便重连。")
+                        # 更新连接状态
+                        if gui_state is not None:
+                            with gui_state['lock']:
+                                gui_state['connection_active'] = False
+                                gui_state['reload_requested'] = True
                         try:
                             progress_task.cancel()
                             sender_task.cancel()
@@ -959,6 +950,11 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     
                     if not sender_ok or not receiver_ok or not progress_ok:
                         logging.warning(f"健康检查：任务状态异常 [发送:{sender_ok} 接收:{receiver_ok} 进度:{progress_ok}]，退出以便重连。")
+                        # 更新连接状态
+                        if gui_state is not None:
+                            with gui_state['lock']:
+                                gui_state['connection_active'] = False
+                                gui_state['reload_requested'] = True
                         try:
                             progress_task.cancel()
                             sender_task.cancel()
@@ -1179,6 +1175,26 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         return 0.0
 
 
+def restart_program():
+    """重启程序
+    
+    通过 os.execv 重新启动当前进程，保持相同的命令行参数。
+    这是最可靠的"重载"方式，确保所有状态完全重置。
+    """
+    logging.info("=" * 60)
+    logging.info("执行程序重启...")
+    logging.info("=" * 60)
+    
+    try:
+        python = sys.executable
+        logging.info(f"重启命令: {python} {' '.join(sys.argv)}")
+        os.execv(python, [python] + sys.argv)
+    except Exception as e:
+        logging.error(f"重启失败: {e}")
+        logging.error("程序将退出，请手动重启。")
+        sys.exit(1)
+
+
 async def run_forever(config, users_with_tokens, images_data, debug=False, gui_state=None):
     """带自动重连的持久运行包装器。
 
@@ -1190,6 +1206,7 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
     - 连接成功后重置退避
     - 详细的重连日志和诊断信息
     - 统计连接质量指标
+    - 支持手动重载连接
     """
     backoff = 1.0
     backoff_max = 60.0
@@ -1199,6 +1216,16 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
     successful_connections = 0
     
     while True:
+        # 检查是否有重载请求
+        if gui_state is not None and gui_state.get('reload_requested'):
+            with gui_state['lock']:
+                gui_state['reload_requested'] = False
+            logging.info("检测到重载请求，将重启程序以完全重置状态...")
+            # 重启程序
+            restart_program()
+            # 如果 restart_program 失败返回，则退出循环
+            break
+        
         # GUI 请求停止则退出
         if gui_state is not None and gui_state.get('stop'):
             logging.info('检测到停止标记，结束 run_forever 循环。')
@@ -1213,7 +1240,15 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
             else:
                 logging.info(f"尝试重新连接 WebSocket (第 {reconnect_count} 次尝试，累计成功连接: {successful_connections} 次，总连接时长: {total_connected_time:.1f}s)...")
             
-            duration = await handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state)
+            # 根据配置和多连接模块可用性选择连接处理函数
+            use_multi = USE_MULTI_CONN and config.get("writeonly_connections", 0) > 0
+            if use_multi:
+                duration = await multi_conn_patch.handle_websocket_multi(config, users_with_tokens, images_data, debug, gui_state=gui_state)
+                logging.debug("使用多连接模式")
+            else:
+                duration = await handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state)
+                logging.debug("使用单连接模式")
+            
             last_successful_duration = duration if isinstance(duration, (int, float)) else 0
             
             # 统计成功连接
@@ -1254,6 +1289,12 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
                 logging.info(f'本次连接稳定性评分: {stability_score:.1f}/100')
             
             logging.warning(f'主循环意外结束（运行时长: {last_successful_duration:.1f}s，原因: {exit_reason}），将在短暂等待后尝试重连。')
+            
+            # 检查是否触发了自动重载（连接异常时设置）
+            if gui_state is not None and gui_state.get('reload_requested'):
+                logging.info("检测到自动重载标志，将立即重启程序...")
+                restart_program()
+                break  # 如果重启失败，退出循环
             
         except (websockets.exceptions.ConnectionClosedError,
                 websockets.exceptions.ConnectionClosedOK,
@@ -1299,6 +1340,12 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
             # 未预期异常，使用较大的退避
             backoff = min(backoff * 2.5, backoff_max)
 
+        # 检查是否需要立即重启（自动或手动触发）
+        if gui_state is not None and gui_state.get('reload_requested'):
+            logging.info("检测到重载标志，将立即重启程序...")
+            restart_program()
+            break  # 如果重启失败，退出循环
+
         # 指数回退的等待；等待期间可响应停止
         wait_left = backoff
         if reconnect_count == 1:
@@ -1310,9 +1357,16 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
             logging.info(f'连接统计 - 成功: {successful_connections} 次，平均时长: {avg_duration:.1f}s，退出原因: {exit_reason}')
         
         while wait_left > 0:
-            if gui_state is not None and gui_state.get('stop'):
-                logging.info('检测到停止标记，放弃重连等待。')
-                return
+            if gui_state is not None:
+                # 优先检查重载请求
+                if gui_state.get('reload_requested'):
+                    logging.info('等待期间检测到重载请求，立即重启程序。')
+                    restart_program()
+                    return
+                # 其次检查停止请求
+                if gui_state.get('stop'):
+                    logging.info('检测到停止标记，放弃重连等待。')
+                    return
             await asyncio.sleep(min(1.0, wait_left))
             wait_left -= 1.0
     
@@ -1523,6 +1577,8 @@ def main():
             gui_state = {
                 'lock': threading.RLock(),
                 'stop': False,
+                'reload_requested': False,  # 重载请求标志
+                'connection_active': False,  # 连接活跃状态
                 'board_state': {},
                 'overlay': False,
                 'images_data': images_data,

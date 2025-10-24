@@ -10,32 +10,68 @@ import asyncio
 import websockets
 
 # --- 绘画相关工具与队列（从 main.py 拆分） ---
-# 全局粘包队列（供 send_paint_data 与 paint 使用）
-paint_queue = []
-total_size = 0
+# 多连接支持：使用字典存储每个连接的队列
+# connection_queues[conn_id] = {'queue': [...], 'size': int}
+connection_queues = {}
+import threading
+queue_lock = threading.RLock()
 
-def append_to_queue(paint_data):
-    """将绘画数据添加到粘包队列"""
-    global paint_queue, total_size
-    paint_queue.append(paint_data)
-    total_size += len(paint_data)
+def init_connection_queue(conn_id):
+    """为指定连接 ID 初始化队列"""
+    global connection_queues
+    with queue_lock:
+        if conn_id not in connection_queues:
+            connection_queues[conn_id] = {'queue': [], 'size': 0}
+            logging.debug(f"初始化连接 {conn_id} 的队列")
 
-def get_merged_data():
-    """合并队列中的所有数据块并清空队列"""
-    global paint_queue, total_size
-    if not paint_queue:
-        return None
-    merged = bytearray(total_size)
-    offset = 0
-    for chunk in paint_queue:
-        merged[offset:offset + len(chunk)] = chunk
-        offset += len(chunk)
-    paint_queue = []
-    total_size = 0
-    return merged
+def append_to_queue(paint_data, conn_id=0):
+    """将绘画数据添加到指定连接的粘包队列"""
+    global connection_queues
+    with queue_lock:
+        if conn_id not in connection_queues:
+            init_connection_queue(conn_id)
+        connection_queues[conn_id]['queue'].append(paint_data)
+        connection_queues[conn_id]['size'] += len(paint_data)
 
-async def paint(ws, uid, token, r, g, b, x, y, paint_id):
-    """准备绘画数据并加入队列（非阻塞）"""
+def get_merged_data(conn_id=0):
+    """合并指定连接队列中的所有数据块并清空队列"""
+    global connection_queues
+    with queue_lock:
+        if conn_id not in connection_queues or not connection_queues[conn_id]['queue']:
+            return None
+        
+        queue_data = connection_queues[conn_id]
+        merged = bytearray(queue_data['size'])
+        offset = 0
+        for chunk in queue_data['queue']:
+            merged[offset:offset + len(chunk)] = chunk
+            offset += len(chunk)
+        
+        queue_data['queue'] = []
+        queue_data['size'] = 0
+        return merged
+
+# 兼容旧代码：提供全局访问器
+def get_paint_queue(conn_id=0):
+    """获取指定连接的队列（兼容旧代码）"""
+    with queue_lock:
+        if conn_id not in connection_queues:
+            return []
+        return connection_queues[conn_id]['queue']
+
+def get_total_size(conn_id=0):
+    """获取指定连接的队列大小（兼容旧代码）"""
+    with queue_lock:
+        if conn_id not in connection_queues:
+            return 0
+        return connection_queues[conn_id]['size']
+
+# 为兼容性提供 paint_queue 和 total_size 别名（作为函数调用）
+paint_queue = lambda: get_paint_queue(0)
+total_size = lambda: get_total_size(0)
+
+async def paint(ws, uid, token, r, g, b, x, y, paint_id, conn_id=0):
+    """准备绘画数据并加入队列（非阻塞），支持多连接"""
     try:
         try:
             token_bytes = UUID(token).bytes
@@ -53,12 +89,12 @@ async def paint(ws, uid, token, r, g, b, x, y, paint_id):
         paint_data[8:11] = uid.to_bytes(3, 'little')
         paint_data[11:27] = token_bytes
         paint_data[27:31] = paint_id.to_bytes(4, 'little')
-        append_to_queue(paint_data)
+        append_to_queue(paint_data, conn_id)
     except Exception as e:
         logging.error(f"创建绘画数据时出错: {e}")
 
-async def send_paint_data(ws, interval_ms):
-    """定时发送粘合后的绘画数据包（后台任务）
+async def send_paint_data(ws, interval_ms, conn_id=0):
+    """定时发送粘合后的绘画数据包（后台任务），支持多连接
     
     增强稳定性：
     - 更健壮的连接状态检查
@@ -83,52 +119,65 @@ async def send_paint_data(ws, interval_ms):
                 
             if not is_open:
                 # 连接已关闭，保留队列数据并退出
-                logging.warning("检测到连接已关闭，发送任务退出以便重连。")
+                logging.warning(f"连接 {conn_id} 已关闭，发送任务退出以便重连。")
                 break
                 
-            if paint_queue:
-                merged_data = get_merged_data()
+            # 检查该连接的队列
+            with queue_lock:
+                has_data = (conn_id in connection_queues and 
+                           connection_queues[conn_id]['queue'])
+            
+            if has_data:
+                merged_data = get_merged_data(conn_id)
                 if merged_data:
                     try:
                         await ws.send(merged_data)
-                        logging.debug(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
+                        logging.debug(f"连接 {conn_id} 已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
                         consecutive_errors = 0  # 成功后重置错误计数
                     except (websockets.exceptions.ConnectionClosed, 
                             websockets.exceptions.ConnectionClosedError, 
                             websockets.exceptions.ConnectionClosedOK) as e:
                         # 连接已关闭，将数据重新入队并退出，交由上层重连逻辑处理
                         err_msg = str(e) if str(e) else e.__class__.__name__
-                        logging.warning(f"发送数据时连接已关闭: {err_msg}; 重新入队数据并退出发送任务。")
+                        logging.warning(f"连接 {conn_id} 发送数据时连接已关闭: {err_msg}; 重新入队数据并退出发送任务。")
                         try:
-                            append_to_queue(merged_data)
+                            append_to_queue(merged_data, conn_id)
                         except Exception as re_queue_err:
-                            # 如果 append 失败，则放到全局 paint_queue 保底
-                            logging.debug(f"重新入队时出错: {re_queue_err}，尝试直接插入队列")
+                            logging.debug(f"连接 {conn_id} 重新入队时出错: {re_queue_err}，尝试直接插入队列")
                             try:
-                                paint_queue.insert(0, merged_data)
+                                with queue_lock:
+                                    if conn_id in connection_queues:
+                                        connection_queues[conn_id]['queue'].insert(0, merged_data)
+                                        connection_queues[conn_id]['size'] += len(merged_data)
                             except Exception as insert_err:
-                                logging.warning(f"无法保存待发送数据: {insert_err}")
+                                logging.warning(f"连接 {conn_id} 无法保存待发送数据: {insert_err}")
                         break
                     except asyncio.TimeoutError as e:
                         # 发送超时，重新入队并计数
-                        logging.warning(f"发送数据超时: {e}; 重新入队数据。")
+                        logging.warning(f"连接 {conn_id} 发送数据超时: {e}; 重新入队数据。")
                         consecutive_errors += 1
                         try:
-                            append_to_queue(merged_data)
+                            append_to_queue(merged_data, conn_id)
                         except Exception:
                             try:
-                                paint_queue.insert(0, merged_data)
+                                with queue_lock:
+                                    if conn_id in connection_queues:
+                                        connection_queues[conn_id]['queue'].insert(0, merged_data)
+                                        connection_queues[conn_id]['size'] += len(merged_data)
                             except Exception:
                                 pass
                         await asyncio.sleep(1.0)
                     except asyncio.CancelledError:
                         # 任务被取消，重新入队数据并退出
-                        logging.info("发送任务被取消，重新入队数据。")
+                        logging.info(f"连接 {conn_id} 发送任务被取消，重新入队数据。")
                         try:
-                            append_to_queue(merged_data)
+                            append_to_queue(merged_data, conn_id)
                         except Exception:
                             try:
-                                paint_queue.insert(0, merged_data)
+                                with queue_lock:
+                                    if conn_id in connection_queues:
+                                        connection_queues[conn_id]['queue'].insert(0, merged_data)
+                                        connection_queues[conn_id]['size'] += len(merged_data)
                             except Exception:
                                 pass
                         raise
@@ -136,13 +185,16 @@ async def send_paint_data(ws, interval_ms):
                         # 其它异常：记录并将数据重入队
                         err_msg = str(e) if str(e) else e.__class__.__name__
                         err_type = e.__class__.__name__
-                        logging.error(f"发送数据时出错 ({err_type}): {err_msg}")
+                        logging.error(f"连接 {conn_id} 发送数据时出错 ({err_type}): {err_msg}")
                         consecutive_errors += 1
                         try:
-                            append_to_queue(merged_data)
+                            append_to_queue(merged_data, conn_id)
                         except Exception:
                             try:
-                                paint_queue.insert(0, merged_data)
+                                with queue_lock:
+                                    if conn_id in connection_queues:
+                                        connection_queues[conn_id]['queue'].insert(0, merged_data)
+                                        connection_queues[conn_id]['size'] += len(merged_data)
                             except Exception:
                                 pass
                         # 避免快速循环重试造成 CPU 飙升
@@ -150,18 +202,18 @@ async def send_paint_data(ws, interval_ms):
                     
                     # 连续错误过多时退出，让上层重连
                     if consecutive_errors >= max_consecutive_errors:
-                        logging.error(f"连续发送失败 {consecutive_errors} 次，发送任务退出以便重连。")
+                        logging.error(f"连接 {conn_id} 连续发送失败 {consecutive_errors} 次，发送任务退出以便重连。")
                         break
     except asyncio.CancelledError:
         # 任务被取消时正常退出
-        logging.debug("发送任务被取消。")
+        logging.debug(f"连接 {conn_id} 发送任务被取消。")
         raise
     except Exception as e:
         # 捕获任何未预期的异常，避免任务静默失败
         err_msg = str(e) if str(e) else e.__class__.__name__
-        logging.error(f"发送任务遇到未预期异常: {err_msg}，任务退出。")
+        logging.error(f"连接 {conn_id} 发送任务遇到未预期异常: {err_msg}，任务退出。")
     finally:
-        logging.info("发送任务已退出。")
+        logging.info(f"连接 {conn_id} 发送任务已退出。")
 
 
 def build_target_map(pixels, width, height, start_x, start_y, config=None):
