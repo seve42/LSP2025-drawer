@@ -1691,6 +1691,15 @@ def main(args):
                     gui_state['stop'] = True
                 t.join(timeout=5)
                 logging.info('WebUI 退出，后台任务已请求停止。')
+    except Exception as e:
+        # 捕获顶层未处理异常，记录日志并尝试优雅停止后台任务
+        logging.exception(f"主程序发生未处理异常: {e}")
+        try:
+            if 'gui_state' in locals():
+                with gui_state['lock']:
+                    gui_state['stop'] = True
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main_wrapper()
