@@ -306,6 +306,25 @@ def load_config():
                 'enabled': True
             }]
         
+        # 清理用户配置中可能残留的 token 字段，避免将 token persisted 在 config.json
+        try:
+            users = cfg.get('users', [])
+            cleaned = False
+            for u in users:
+                if 'token' in u or 'token_time' in u:
+                    u.pop('token', None)
+                    u.pop('token_time', None)
+                    cleaned = True
+            if cleaned:
+                # 保存清理后的配置
+                try:
+                    save_config(cfg)
+                    logging.info("已从 config.json 中移除 token 字段并保存清理后的配置。")
+                except Exception:
+                    logging.exception("保存清理后的 config 失败")
+        except Exception:
+            logging.exception('清理 token 字段时出错')
+
         return cfg
     except FileNotFoundError:
         logging.warning("找不到 config.json，正在创建默认配置...")
@@ -1471,25 +1490,9 @@ def main(args):
     def get_tokens_with_progress(users_list, allow_gui=True):
         results = []
         total = len(users_list)
-        # 尝试在主线程创建一个临时 Tk 窗口（仅用于进度显示）
-        use_tk = False
+        # 使用 CLI 进度显示（始终采用命令行输出，不创建任何 Tk 窗口）
         progress = None
         root = None
-        try:
-            if not cli_only and allow_gui:
-                import tkinter as tk
-                from tkinter import ttk
-                root = tk.Tk()
-                root.title('获取 Token 中...')
-                root.geometry('400x80')
-                ttk.Label(root, text='正在获取用户 Token，请稍候...').pack(pady=(8,0))
-                progress = ttk.Progressbar(root, orient='horizontal', length=360, mode='determinate', maximum=total)
-                progress.pack(pady=(6,8))
-                root.update()
-                use_tk = True
-        except Exception:
-            # 无法创建 GUI，回退到控制台
-            use_tk = False
 
         idx = 0
         for user in users_list:
@@ -1497,75 +1500,35 @@ def main(args):
             ak = user.get('access_key')
             token = None
             token_from_config = user.get('token')
-            token_time = user.get('token_time', 0)
             now_ts = int(time.time())
-            # 若配置中有 access_key，则优先通过接口获取真实 token，失败再回退到配置中的 token
+            # 若配置中有 access_key，则每次启动都通过接口获取真实 token（不写回到 config.json）
             if ak:
-                # 如果配置中已有 token 且 token_time 在 1 小时内，则复用并跳过请求
-                if token_from_config and token_time and (now_ts - int(token_time) < 3600):
+                fetched = None
+                try:
+                    fetched = get_token(uid, ak)
+                except Exception:
+                    fetched = None
+                if fetched:
+                    token = fetched
+                else:
+                    logging.warning(f"无法通过 access_key 获取 token: uid={uid}，该用户将被跳过。")
+            else:
+                # 无 access_key，若配置含 token（仅作回退使用），则使用但不保存到 config
+                if token_from_config:
                     token = token_from_config
                 else:
-                    fetched = None
-                    try:
-                        fetched = get_token(uid, ak)
-                    except Exception:
-                        fetched = None
-                    if fetched:
-                        token = fetched
-                        # 将新获取的 token 及时间写回配置并持久化
-                        try:
-                            user['token'] = token
-                            user['token_time'] = now_ts
-                            save_config(config)
-                        except Exception:
-                            logging.exception('写回 token 到 config 失败')
-                    elif token_from_config:
-                        # 获取失败，回退使用配置中的 token（可能无 token_time 或已过期），记录警告并保存当前时间以避免频繁重试
-                        token = token_from_config
-                        logging.warning(f"获取 token 失败，回退使用配置中的 token: uid={uid}")
-                        try:
-                            user['token_time'] = now_ts
-                            save_config(config)
-                        except Exception:
-                            pass
-                    else:
-                        logging.warning(f"既无法通过 access_key 获取 token，也未在配置中提供 token: uid={uid}，跳过。")
-            else:
-                # 无 access_key，若配置含 token 则直接使用
-                if token_from_config:
-                    # 若存在 token_time 并且未过期则直接使用；否则标记当前时间并保存
-                    if token_time and (now_ts - int(token_time) < 3600):
-                        token = token_from_config
-                    else:
-                        token = token_from_config
-                        try:
-                            user['token_time'] = now_ts
-                            save_config(config)
-                        except Exception:
-                            pass
-                else:
                     logging.warning(f"用户条目缺少 access_key 且未提供 token: uid={uid}，跳过。")
+            # 已处理 access_key / 无 access_key 的情况（不再向 config 写入 token）
 
             if token:
                 results.append({'uid': uid, 'token': token})
             idx += 1
-            if use_tk and progress is not None:
-                try:
-                    progress['value'] = idx
-                    root.update()
-                except Exception:
-                    pass
-            else:
-                sys.stdout.write(f'获取 token 进度: {idx}/{total}\r')
-                sys.stdout.flush()
+            # CLI 进度输出
+            sys.stdout.write(f'获取 token 进度: {idx}/{total}\r')
+            sys.stdout.flush()
 
-        if use_tk and root is not None:
-            try:
-                root.destroy()
-            except Exception:
-                pass
-        else:
-            print('')
+        # 换行完成进度输出
+        print('')
         return results
 
     users_with_tokens = get_tokens_with_progress(config.get('users', []), allow_gui=True)
