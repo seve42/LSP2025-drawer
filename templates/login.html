@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>登录 - LSP2025 Drawer</title>
+    <style>
+        body{font-family: Arial, sans-serif;background:#f4f6f8;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+        .card{background:#fff;padding:24px;border-radius:8px;box-shadow:0 4px 20px rgba(0,0,0,0.08);width:360px}
+        h2{margin:0 0 12px 0;font-size:18px}
+        .form-group{margin-bottom:12px}
+        input[type=password]{width:100%;padding:10px;border:1px solid #ddd;border-radius:4px;font-size:14px}
+        button{width:100%;padding:10px;border:0;border-radius:4px;background:#4CAF50;color:#fff;font-size:14px}
+        .error{color:#b00020;margin-bottom:8px}
+        .note{font-size:12px;color:#666;margin-top:10px;text-align:center}
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>请登录 Web 控制面板</h2>
+        {% if error %}
+        <div class="error">{{ error }}</div>
+        {% endif %}
+        <form method="post">
+            <div class="form-group">
+                <input type="password" name="password" placeholder="请输入密码" required autofocus>
+            </div>
+            <button type="submit">登录</button>
+        </form>
+        <div class="note">默认密码可在 config.json 中配置字段 <code>webui_password</code></div>
+    </div>
+</body>
+</html>

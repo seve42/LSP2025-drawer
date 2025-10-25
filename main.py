@@ -1276,12 +1276,57 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
     last_successful_duration = 0
     total_connected_time = 0.0
     successful_connections = 0
+    # Token 刷新控制：默认每 3600 秒（1 小时）刷新一次，可通过 config['token_refresh_interval_seconds'] 覆盖
+    token_refresh_interval = int(config.get('token_refresh_interval_seconds', 3600)) if isinstance(config, dict) else 3600
+    last_token_refresh = time.monotonic()
     
     while True:
         # GUI 请求停止则退出
         if gui_state is not None and gui_state.get('stop'):
             logging.info('检测到停止标记，结束 run_forever 循环。')
             break
+        # 周期性刷新用户 tokens（在后台线程执行以避免阻塞 asyncio loop）
+        try:
+            now = time.monotonic()
+            if now - last_token_refresh >= token_refresh_interval:
+                logging.info(f"达到 token 刷新间隔 ({token_refresh_interval}s)，开始重新获取用户 tokens...")
+
+                def fetch_tokens_sync():
+                    new_list = []
+                    users_cfg = config.get('users', []) if isinstance(config, dict) else []
+                    for u in users_cfg:
+                        uid = u.get('uid')
+                        ak = u.get('access_key')
+                        token = None
+                        if ak:
+                            try:
+                                token = get_token(uid, ak)
+                            except Exception:
+                                token = None
+                        else:
+                            token = u.get('token')
+                        if token:
+                            new_list.append({'uid': uid, 'token': token})
+                    return new_list
+
+                try:
+                    loop = asyncio.get_running_loop()
+                    new_tokens = await loop.run_in_executor(None, fetch_tokens_sync)
+                    if new_tokens:
+                        try:
+                            users_with_tokens.clear()
+                            users_with_tokens.extend(new_tokens)
+                            logging.info(f"已刷新 {len(new_tokens)} 个用户的 token。")
+                        except Exception:
+                            logging.exception('更新 users_with_tokens 时出错')
+                    else:
+                        logging.warning('刷新 token 未获取到任何 token，保留原有 tokens。')
+                except Exception:
+                    logging.exception('后台刷新 tokens 时出错')
+                finally:
+                    last_token_refresh = time.monotonic()
+        except Exception:
+            logging.exception('检查 token 刷新条件时发生错误')
         reconnect_count += 1
         connection_start = time.monotonic()
         exit_reason = "未知原因"

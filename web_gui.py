@@ -6,7 +6,7 @@ import json
 import os
 import threading
 import time
-from flask import Flask, render_template, jsonify, request, send_from_directory
+from flask import Flask, render_template, jsonify, request, send_from_directory, session, redirect, url_for
 from flask_socketio import SocketIO, emit
 from PIL import Image
 import base64
@@ -17,6 +17,57 @@ import sys
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'lsp2025-drawer-secret'
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode='threading')
+
+# 简单的会话/登录保护
+@app.before_request
+def require_login():
+    # 允许无需登录访问的路径
+    allowed_paths = ('/login', '/static/', '/socket.io/')
+    # allow flask static endpoint too
+    if request.path == '/' and session.get('logged_in'):
+        return None
+    for p in allowed_paths:
+        if request.path.startswith(p):
+            return None
+
+    # 若已经登录，允许
+    if session.get('logged_in'):
+        return None
+
+    # 对 API 返回 JSON 401，对于页面重定向到登录页
+    if request.path.startswith('/api'):
+        return jsonify({'error': 'authentication required'}), 401
+    # 其它页面重定向到登录
+    return redirect(url_for('login'))
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    """简单登录页，POST password 字段进行校验。"""
+    # 允许从 config 或环境变量读取密码，默认 KenmaBuGaoJi
+    expected = None
+    try:
+        expected = (config.get('webui_password') if config else None) or os.environ.get('WEBUI_PASSWORD')
+    except Exception:
+        expected = os.environ.get('WEBUI_PASSWORD')
+    if not expected:
+        expected = 'KenmaBuGaoJi'
+
+    if request.method == 'POST':
+        pw = request.form.get('password', '')
+        if pw == expected:
+            session['logged_in'] = True
+            return redirect(url_for('index'))
+        else:
+            return render_template('login.html', error='密码错误')
+
+    return render_template('login.html', error=None)
+
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('login'))
 
 # 全局日志
 web_logs = []
