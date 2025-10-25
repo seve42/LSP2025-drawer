@@ -513,13 +513,13 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         # 限制握手与关闭超时，避免卡住；部分环境下可减轻“opening handshake 超时”的长期滞留
         async with websockets.connect(
             WS_URL,
-            ping_interval=20,      # 每20秒发送一次 ping（服务器要求30秒内响应）
-            ping_timeout=25,       # 25秒超时（留出余量，避免 Ping timeout）
+            ping_interval=None,    # 禁用 websockets 库的自动 ping（完全依赖应用层心跳）
+            ping_timeout=None,     # 禁用 websockets 库的 ping 超时检测
             open_timeout=30,       # 增加握手超时到30秒
             close_timeout=10,
             max_size=10 * 1024 * 1024,  # 10MB 消息大小限制
         ) as ws:
-            logging.info("WebSocket 连接已建立（心跳优化: ping间隔=20s, 超时=25s）")
+            logging.info("WebSocket 连接已建立")
             # 更新 GUI 状态：已连接
             try:
                 if gui_state is not None:
@@ -586,26 +586,19 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                 opcode = data[offset]
                                 offset += 1
                                 if opcode == 0xfc:  # Heartbeat Ping
-                                    logging.debug("收到 Ping，发送 Pong。")
+                                    # 【关键修复】将 Pong 响应加入粘包队列，而不是单独发送
+                                    # 根据文档："绘版后端已经改用粘性发包"，"切记使用粘包发送"
+                                    # Pong 必须通过粘包队列发送，单独发送会违反协议导致连接断开
+                                    logging.debug("收到 Ping，将 Pong 加入粘包队列。")
                                     try:
-                                        await ws.send(bytes([0xfb]))
-                                        consecutive_errors = 0  # 成功响应心跳后重置错误计数
-                                    except (websockets.exceptions.ConnectionClosed,
-                                            websockets.exceptions.ConnectionClosedError,
-                                            websockets.exceptions.ConnectionClosedOK) as e:
-                                        err_msg = str(e) if str(e) else e.__class__.__name__
-                                        logging.info(f"响应 Pong 时连接已关闭: {err_msg}，等待重连。")
-                                        # 不要立即退出，让健康检查来处理
-                                        consecutive_errors += 1
-                                        if consecutive_errors >= max_consecutive_errors:
-                                            logging.warning("心跳响应连续失败次数过多，接收任务退出。")
-                                            return
+                                        tool.append_to_queue(bytes([0xfb]))
+                                        consecutive_errors = 0  # 成功处理心跳后重置错误计数
                                     except Exception as e:
                                         err_msg = str(e) if str(e) else e.__class__.__name__
-                                        logging.warning(f"响应 Pong 失败: {err_msg}")
+                                        logging.warning(f"处理 Pong 时出错: {err_msg}")
                                         consecutive_errors += 1
                                         if consecutive_errors >= max_consecutive_errors:
-                                            logging.error("心跳响应连续失败，接收任务退出。")
+                                            logging.error("心跳处理连续失败，接收任务退出。")
                                             return
                                 elif opcode == 0xff:  # 绘画结果
                                     if offset + 5 > len(data):
