@@ -14,6 +14,8 @@ import tool
 import ping
 import threading
 from collections import OrderedDict, deque
+import multiprocessing
+import queue
 
 # --- 全局配置 ---
 API_BASE_URL = "https://paintboard.luogu.me"
@@ -561,13 +563,21 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             # 画板状态改变事件（用于唤醒调度器进行即时修复）
             state_changed_event = asyncio.Event()
 
-            # 创建心跳管理器
-            heartbeat_manager = ping.HeartbeatManager(ws, timeout=30.0)
-            
-            # 启动心跳监控任务（可选，用于定期输出心跳状态）
-            heartbeat_monitor_task = asyncio.create_task(
-                ping.monitor_heartbeat(heartbeat_manager, check_interval=30.0)
-            )
+            # 启动独立的 Ping 处理进程（通过两个 multiprocessing.Queue 与之通信）
+            try:
+                ping_in_q = multiprocessing.Queue()
+                ping_out_q = multiprocessing.Queue()
+                ping_proc = ping.PingProcess(ping_in_q, ping_out_q, timeout=30.0, max_consec_fail=10)
+                ping_proc.start()
+                logging.info(f"已启动独立 Ping 进程 (pid={getattr(ping_proc, 'pid', None)})")
+            except Exception as e:
+                logging.exception(f"启动 Ping 进程失败: {e}")
+                ping_in_q = None
+                ping_out_q = None
+                ping_proc = None
+
+            # 为兼容后续清理逻辑，创建一个已完成的占位任务（无需实际监控任务）
+            heartbeat_monitor_task = asyncio.create_task(asyncio.sleep(0))
             
             # 启动接收任务：处理 Ping(0xfc)、绘画结果(0xff)、画板更新(0xfa) 等
             async def receiver():
@@ -596,17 +606,57 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                 opcode = data[offset]
                                 offset += 1
                                 if opcode == 0xfc:  # Heartbeat Ping
-                                    # 【关键修复】使用专门的心跳管理器处理 Ping
-                                    # 心跳管理器会立即发送 Pong，不经过粘包队列
-                                    success = await heartbeat_manager.handle_ping()
-                                    if success:
-                                        consecutive_errors = 0  # 成功处理心跳后重置错误计数
+                                    # 将 ping 事件转发到独立的 Ping 进程（若可用）
+                                    resp = None
+                                    if 'ping_in_q' in locals() and ping_in_q is not None and ping_out_q is not None:
+                                        try:
+                                            ping_in_q.put({'type': 'ping', 'ts': time.monotonic()})
+                                        except Exception as e:
+                                            logging.warning(f"向 ping 进程发送 ping 事件失败: {e}")
+                                            # 标记不可用，回退到直接发送
+                                            ping_in_q = None
+
+                                        # 尝试短暂等待来自 ping 进程的指令（非阻塞主事件循环）
+                                        try:
+                                            loop = asyncio.get_running_loop()
+                                            resp = await loop.run_in_executor(None, ping_out_q.get, True, 0.05)
+                                        except Exception:
+                                            resp = None
+
+                                    # 处理 ping 进程的响应
+                                    if isinstance(resp, dict) and resp.get('cmd') == 'send_pong':
+                                        try:
+                                            await ws.send(bytes([0xfb]))
+                                            consecutive_errors = 0
+                                        except Exception as e:
+                                            err_msg = str(e) if str(e) else e.__class__.__name__
+                                            logging.warning(f"发送 Pong 时出错: {err_msg}")
+                                            consecutive_errors += 1
+                                            if consecutive_errors >= max_consecutive_errors:
+                                                logging.error("心跳处理连续失败，接收任务退出。")
+                                                if 'ping_proc' in locals() and ping_proc is not None:
+                                                    logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)}")
+                                                return
+                                    elif isinstance(resp, dict) and resp.get('cmd') == 'restart':
+                                        logging.warning("Ping 进程请求重启主进程")
+                                        try:
+                                            tool.restart_script()
+                                        except Exception:
+                                            pass
                                     else:
-                                        consecutive_errors += 1
-                                        if consecutive_errors >= max_consecutive_errors:
-                                            logging.error("心跳处理连续失败，接收任务退出。")
-                                            logging.info(heartbeat_manager.get_summary())
-                                            return
+                                        # 回退：立即在当前连接上发送 Pong（保证实时性）
+                                        try:
+                                            await ws.send(bytes([0xfb]))
+                                            consecutive_errors = 0
+                                        except Exception as e:
+                                            err_msg = str(e) if str(e) else e.__class__.__name__
+                                            logging.warning(f"发送 Pong (fallback) 时出错: {err_msg}")
+                                            consecutive_errors += 1
+                                            if consecutive_errors >= max_consecutive_errors:
+                                                logging.error("心跳处理连续失败，接收任务退出。")
+                                                if 'ping_proc' in locals() and ping_proc is not None:
+                                                    logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)}")
+                                                return
                                 elif opcode == 0xff:  # 绘画结果
                                     if offset + 5 > len(data):
                                         break
@@ -688,24 +738,36 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     
                     # 正常退出循环（连接关闭）
                     logging.info(f"WebSocket 消息流结束（共接收 {message_count} 条消息），接收任务退出。")
-                    logging.info(f"[最终] {heartbeat_manager.get_summary()}")
+                    if 'ping_proc' in locals() and ping_proc is not None:
+                        logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)} 状态: {'alive' if ping_proc.is_alive() else 'stopped'}")
+                    else:
+                        logging.info("Ping 进程信息不可用（使用内置心跳或未创建）")
                     
                 except (websockets.exceptions.ConnectionClosed,
                         websockets.exceptions.ConnectionClosedError,
                         websockets.exceptions.ConnectionClosedOK) as e:
                     err_msg = str(e) if str(e) else e.__class__.__name__
                     logging.info(f"WebSocket 连接已关闭: {err_msg} (接收了 {message_count} 条消息)")
-                    logging.info(f"[最终] {heartbeat_manager.get_summary()}")
+                    if 'ping_proc' in locals() and ping_proc is not None:
+                        logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)} 状态: {'alive' if ping_proc.is_alive() else 'stopped'}")
+                    else:
+                        logging.info("Ping 进程信息不可用（使用内置心跳或未创建）")
                 except asyncio.CancelledError:
                     # 任务被取消时正常退出
                     logging.debug(f"接收任务被取消 (已接收 {message_count} 条消息)")
-                    logging.debug(f"[最终] {heartbeat_manager.get_summary()}")
+                    if 'ping_proc' in locals() and ping_proc is not None:
+                        logging.debug(f"Ping 进程 pid={getattr(ping_proc,'pid',None)} 状态: {'alive' if ping_proc.is_alive() else 'stopped'}")
+                    else:
+                        logging.debug("Ping 进程信息不可用（使用内置心跳或未创建）")
                     raise
                 except Exception as e:
                     err_msg = str(e) if str(e) else e.__class__.__name__
                     err_type = e.__class__.__name__
                     logging.exception(f"WebSocket 接收处理时发生未预期异常 ({err_type}): {err_msg}")
-                    logging.info(f"[最终] {heartbeat_manager.get_summary()}")
+                    if 'ping_proc' in locals() and ping_proc is not None:
+                        logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)} 状态: {'alive' if ping_proc.is_alive() else 'stopped'}")
+                    else:
+                        logging.info("Ping 进程信息不可用（使用内置心跳或未创建）")
                 finally:
                     logging.info("接收任务已退出。")
 
@@ -1248,6 +1310,21 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     logging.debug("等待后台任务退出超时")
                 except Exception:
                     pass
+
+            # 关闭并清理 Ping 进程（如存在）
+            try:
+                if 'ping_in_q' in locals() and ping_in_q is not None:
+                    try:
+                        ping_in_q.put({'cmd': 'shutdown'})
+                    except Exception:
+                        pass
+                if 'ping_proc' in locals() and ping_proc is not None:
+                    try:
+                        ping_proc.join(timeout=1.0)
+                    except Exception:
+                        pass
+            except Exception:
+                logging.debug('清理 Ping 进程时出错')
 
             # 不等待队列清空，直接返回让 run_forever 重连
             # 队列中的数据会在下次连接时重新发送

@@ -17,6 +17,8 @@ import logging
 import time
 from typing import Optional
 import websockets
+import multiprocessing
+import queue
 
 
 class HeartbeatManager:
@@ -206,6 +208,84 @@ async def send_pong(ws) -> bool:
         return False
 
 
+class PingProcess(multiprocessing.Process):
+    """独立进程：接收来自主进程的 ping 事件并输出控制命令。
+
+    设计：
+    - 主进程将接收到的 Ping 事件通过 in_queue 发送到此进程。
+    - 此进程立即在 out_queue 中放入 {'cmd':'send_pong'} 来请求主进程发送 Pong。
+    - 进程维护心跳统计，并可在异常或连续失败时发出 {'cmd':'restart'}。
+    """
+
+    def __init__(self, in_queue: multiprocessing.Queue, out_queue: multiprocessing.Queue,
+                 timeout: float = 30.0, max_consec_fail: int = 10):
+        super().__init__()
+        self.in_queue = in_queue
+        self.out_queue = out_queue
+        self.timeout = timeout
+        self.max_consec_fail = max_consec_fail
+        self.ping_count = 0
+        self.last_ping_ts = None
+        self.consec_fail = 0
+        self.daemon = True
+
+    def run(self):
+        # 子进程独立初始化日志，以便调试
+        logging.basicConfig(level=logging.INFO, format='[PingProc] %(asctime)s - %(levelname)s - %(message)s')
+        logging.info('PingProcess 启动')
+        try:
+            while True:
+                try:
+                    item = self.in_queue.get(timeout=1.0)
+                except queue.Empty:
+                    # 检查超时
+                    if self.last_ping_ts is not None:
+                        if time.monotonic() - self.last_ping_ts > self.timeout:
+                            logging.warning('长时间未收到 Ping，可能超时')
+                    continue
+
+                if not isinstance(item, dict):
+                    continue
+
+                cmd = item.get('cmd')
+                if cmd == 'shutdown':
+                    logging.info('收到 shutdown，退出 PingProcess')
+                    break
+
+                if item.get('type') == 'ping':
+                    self.ping_count += 1
+                    self.last_ping_ts = time.monotonic()
+                    # 立即请求主进程发送 Pong
+                    try:
+                        self.out_queue.put({'cmd': 'send_pong', 'ts': self.last_ping_ts})
+                    except Exception as e:
+                        logging.warning(f'向 out_queue 发送命令失败: {e}')
+                        self.consec_fail += 1
+                        if self.consec_fail >= self.max_consec_fail:
+                            logging.error('连续向主进程发送命令失败，触发重启请求')
+                            try:
+                                self.out_queue.put({'cmd': 'restart'})
+                            except Exception:
+                                pass
+                # 其他命令可扩展
+
+        except KeyboardInterrupt:
+            logging.info('PingProcess 被中断')
+        except Exception as e:
+            logging.exception(f'PingProcess 发生未预期异常: {e}')
+        finally:
+            logging.info('PingProcess 退出')
+
+
+def start_ping_process():
+    """向外暴露的简单启动辅助（不使用时可忽略）"""
+    in_q = multiprocessing.Queue()
+    out_q = multiprocessing.Queue()
+    p = PingProcess(in_q, out_q)
+    p.start()
+    return p, in_q, out_q
+
+
 # 测试代码（仅在直接运行此文件时执行）
 if __name__ == "__main__":
     logging.basicConfig(
@@ -222,14 +302,11 @@ if __name__ == "__main__":
         async with websockets.connect(WS_URL, ping_interval=None, ping_timeout=None) as ws:
             logging.info("WebSocket 连接已建立，开始测试心跳...")
             
-            # 创建心跳管理器
             hb_manager = HeartbeatManager(ws, timeout=30.0)
             
-            # 启动心跳监控任务
             monitor_task = asyncio.create_task(monitor_heartbeat(hb_manager, check_interval=10.0))
             
             try:
-                # 接收消息并处理心跳
                 async for message in ws:
                     if isinstance(message, str):
                         data = bytearray(message.encode())
