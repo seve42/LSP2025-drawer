@@ -34,6 +34,61 @@ def get_merged_data():
     total_size = 0
     return merged
 
+
+def filter_pong_from_data(data):
+    """从粘包数据中过滤掉所有 Pong (0xfb) 包单元
+    
+    这是为了避免在重连后发送旧的 Pong，导致 "unexpected pong" 协议错误。
+    Pong 是对 Ping 的一次性响应，不应该被重新发送。
+    
+    返回过滤后的数据，如果全部被过滤则返回 None。
+    """
+    if not data:
+        return None
+    
+    result = bytearray()
+    offset = 0
+    
+    while offset < len(data):
+        if offset >= len(data):
+            break
+        opcode = data[offset]
+        
+        # 根据操作码确定包单元大小
+        if opcode == 0xfb:
+            # Pong: 1 字节，跳过不添加到结果
+            offset += 1
+            logging.debug("过滤掉重新入队数据中的 Pong (0xfb)")
+        elif opcode == 0xfe:
+            # 绘画操作: 31 字节
+            packet_size = 31
+            if offset + packet_size <= len(data):
+                result.extend(data[offset:offset + packet_size])
+                offset += packet_size
+            else:
+                # 数据不完整，跳过
+                logging.warning(f"重新入队的数据中包含不完整的绘画包，跳过剩余 {len(data) - offset} 字节")
+                break
+        elif opcode == 0xfc:
+            # 不应该有 Ping，但以防万一
+            offset += 1
+            logging.warning("重新入队的数据中发现 Ping (0xfc)，已跳过")
+        elif opcode == 0xff:
+            # 绘画结果: 6 字节（不应该在发送队列中）
+            offset += 6
+            logging.warning("重新入队的数据中发现绘画结果 (0xff)，已跳过")
+        elif opcode == 0xfa:
+            # 画板更新: 8 字节（不应该在发送队列中）
+            offset += 8
+            logging.warning("重新入队的数据中发现画板更新 (0xfa)，已跳过")
+        else:
+            # 未知操作码，尝试跳过 1 字节
+            logging.warning(f"重新入队的数据中发现未知操作码 0x{opcode:02x}，跳过")
+            offset += 1
+    
+    return bytes(result) if len(result) > 0 else None
+
+
 async def paint(ws, uid, token, r, g, b, x, y, paint_id):
     """准备绘画数据并加入队列（非阻塞）"""
     try:
@@ -104,52 +159,71 @@ async def send_paint_data(ws, interval_ms):
                     except (websockets.exceptions.ConnectionClosed, 
                             websockets.exceptions.ConnectionClosedError, 
                             websockets.exceptions.ConnectionClosedOK) as e:
-                        # 连接关闭，重新入队数据，继续循环等待重连
+                        # 连接关闭，过滤掉 Pong 后重新入队数据，继续循环等待重连
                         err_msg = str(e) if str(e) else e.__class__.__name__
                         logging.warning(f"发送时连接关闭: {err_msg}，数据已重新入队")
                         consecutive_errors += 1
                         try:
-                            append_to_queue(merged_data)
+                            # 【关键修复】过滤掉 Pong，避免在重连后发送旧的 Pong 导致 "unexpected pong" 错误
+                            filtered_data = filter_pong_from_data(merged_data)
+                            if filtered_data:
+                                append_to_queue(filtered_data)
+                            else:
+                                logging.debug("过滤后没有需要重新入队的数据")
                         except Exception:
                             try:
-                                paint_queue.insert(0, merged_data)
+                                filtered_data = filter_pong_from_data(merged_data)
+                                if filtered_data:
+                                    paint_queue.insert(0, filtered_data)
                             except Exception as insert_err:
                                 logging.error(f"无法保存数据: {insert_err}")
                         await asyncio.sleep(1.0)
                     except asyncio.TimeoutError as e:
-                        # 发送超时，重新入队
+                        # 发送超时，过滤掉 Pong 后重新入队
                         logging.warning(f"发送超时，数据已重新入队")
                         consecutive_errors += 1
                         try:
-                            append_to_queue(merged_data)
+                            filtered_data = filter_pong_from_data(merged_data)
+                            if filtered_data:
+                                append_to_queue(filtered_data)
                         except Exception:
                             try:
-                                paint_queue.insert(0, merged_data)
+                                filtered_data = filter_pong_from_data(merged_data)
+                                if filtered_data:
+                                    paint_queue.insert(0, filtered_data)
                             except Exception:
                                 pass
                         await asyncio.sleep(1.0)
                     except asyncio.CancelledError:
-                        # 任务被取消，保存数据并退出
+                        # 任务被取消，过滤掉 Pong 后保存数据并退出
                         logging.info("发送任务被取消，保存数据")
                         try:
-                            append_to_queue(merged_data)
+                            filtered_data = filter_pong_from_data(merged_data)
+                            if filtered_data:
+                                append_to_queue(filtered_data)
                         except Exception:
                             try:
-                                paint_queue.insert(0, merged_data)
+                                filtered_data = filter_pong_from_data(merged_data)
+                                if filtered_data:
+                                    paint_queue.insert(0, filtered_data)
                             except Exception:
                                 pass
                         raise
                     except Exception as e:
-                        # 其他异常，重新入队并继续
+                        # 其他异常，过滤掉 Pong 后重新入队并继续
                         err_msg = str(e) if str(e) else e.__class__.__name__
                         err_type = e.__class__.__name__
                         logging.error(f"发送时出错 ({err_type}): {err_msg}")
                         consecutive_errors += 1
                         try:
-                            append_to_queue(merged_data)
+                            filtered_data = filter_pong_from_data(merged_data)
+                            if filtered_data:
+                                append_to_queue(filtered_data)
                         except Exception:
                             try:
-                                paint_queue.insert(0, merged_data)
+                                filtered_data = filter_pong_from_data(merged_data)
+                                if filtered_data:
+                                    paint_queue.insert(0, filtered_data)
                             except Exception:
                                 pass
                         await asyncio.sleep(1.0)

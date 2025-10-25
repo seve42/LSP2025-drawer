@@ -586,9 +586,8 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                 opcode = data[offset]
                                 offset += 1
                                 if opcode == 0xfc:  # Heartbeat Ping
-                                    # 【关键修复】将 Pong 响应加入粘包队列，而不是单独发送
-                                    # 根据文档："绘版后端已经改用粘性发包"，"切记使用粘包发送"
-                                    # Pong 必须通过粘包队列发送，单独发送会违反协议导致连接断开
+                                    # 【关键修复】心跳响应必须通过粘包队列发送（遵循协议）
+                                    # 但必须确保 Pong 不会在连接断开后被重新入队，避免 "unexpected pong" 错误
                                     logging.debug("收到 Ping，将 Pong 加入粘包队列。")
                                     try:
                                         tool.append_to_queue(bytes([0xfb]))
