@@ -36,6 +36,15 @@ user_last_snapshot = {}
 SNAPSHOT_SIZE = 100
 PENDING_TIMEOUT = 10.0
 
+# WebUI 日志记录器
+def log_to_web_if_available(gui_state, message):
+    """如果 WebUI 可用，则向其发送日志"""
+    if gui_state and 'log_to_web' in gui_state:
+        try:
+            gui_state['log_to_web'](message)
+        except Exception:
+            pass
+
 def save_config(config: dict):
     """保存配置到本地 config.json"""
     try:
@@ -485,13 +494,24 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         # 限制握手与关闭超时，避免卡住；部分环境下可减轻“opening handshake 超时”的长期滞留
         async with websockets.connect(
             WS_URL,
-            ping_interval=15,      # 每15秒发送一次 ping（更频繁，避免服务器超时断开）
-            ping_timeout=45,       # 45秒超时（更宽松，适应网络波动）
+            ping_interval=10,      # 每10秒发送一次 ping（更频繁，快速检测连接问题）
+            ping_timeout=30,       # 30秒超时（缩短超时时间，更快检测失败）
             open_timeout=20,       # 增加握手超时到20秒
             close_timeout=10,
             max_size=10 * 1024 * 1024,  # 10MB 消息大小限制
         ) as ws:
-            logging.info("WebSocket 连接已建立（心跳优化: ping间隔=15s）")
+            logging.info("WebSocket 连接已建立（心跳优化: ping间隔=10s, 超时=30s）")
+            # 更新 GUI 状态：已连接
+            try:
+                if gui_state is not None:
+                    with gui_state['lock']:
+                        gui_state['conn_status'] = 'connected'
+                        # use epoch seconds so frontend can compute wall-clock duration
+                        gui_state['conn_since'] = int(time.time())
+                        gui_state['conn_reason'] = ''
+                        gui_state['server_offline'] = False
+            except Exception:
+                pass
             # 新连接建立时清空待发送队列，避免残留数据
             try:
                 tool.paint_queue.clear()
@@ -591,6 +611,7 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                                     break
                                             if matched is not None:
                                                 uid_matched = matched['uid']
+                                                log_to_web_if_available(gui_state, f"上一轮成功绘画的坐标: ({x}, {y}) by UID {uid_matched}")
                                                 # record into user's last snapshot (ordered dict to keep recent entries)
                                                 snap = user_last_snapshot.get(uid_matched)
                                                 if snap is None:
@@ -614,6 +635,7 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                         if gui_state is not None:
                                             try:
                                                 with gui_state['lock']:
+                                                    # 仅同步画板像素到 GUI，热力图功能已移除，故不再记录 pixel_hits
                                                     gui_state['board_state'][(x, y)] = (r, g, b)
                                             except Exception:
                                                 pass
@@ -855,7 +877,7 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
 
             # 健康检查：定期验证连接和任务状态
             last_health_check = time.monotonic()
-            health_check_interval = 10  # 每10秒进行一次完整健康检查
+            health_check_interval = 5  # 缩短到每5秒进行一次完整健康检查，更快检测连接问题
             last_task_check = time.monotonic()
             task_check_interval = 2  # 每2秒快速检查任务状态
             
@@ -913,14 +935,24 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     if connection_issue:
                         logging.warning("检测到连接异常，退出当前循环以便重连。")
                         try:
-                            progress_task.cancel()
-                            sender_task.cancel()
-                            receiver_task.cancel()
+                            # 只取消未完成的任务，避免对已完成任务调用 cancel()
+                            tasks_to_cancel = []
+                            if not progress_task.done():
+                                progress_task.cancel()
+                                tasks_to_cancel.append(progress_task)
+                            if not sender_task.done():
+                                sender_task.cancel()
+                                tasks_to_cancel.append(sender_task)
+                            if not receiver_task.done():
+                                receiver_task.cancel()
+                                tasks_to_cancel.append(receiver_task)
+                            
                             # 等待任务取消完成
-                            await asyncio.wait_for(
-                                asyncio.gather(progress_task, sender_task, receiver_task, return_exceptions=True),
-                                timeout=2.0
-                            )
+                            if tasks_to_cancel:
+                                await asyncio.wait_for(
+                                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                                    timeout=2.0
+                                )
                         except asyncio.TimeoutError:
                             logging.debug("等待任务取消超时")
                         except Exception as e:
@@ -942,13 +974,23 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     if not is_open:
                         logging.warning("健康检查：检测到 WebSocket 已关闭，退出以便重连。")
                         try:
-                            progress_task.cancel()
-                            sender_task.cancel()
-                            receiver_task.cancel()
-                            await asyncio.wait_for(
-                                asyncio.gather(progress_task, sender_task, receiver_task, return_exceptions=True),
-                                timeout=2.0
-                            )
+                            # 只取消未完成的任务
+                            tasks_to_cancel = []
+                            if not progress_task.done():
+                                progress_task.cancel()
+                                tasks_to_cancel.append(progress_task)
+                            if not sender_task.done():
+                                sender_task.cancel()
+                                tasks_to_cancel.append(sender_task)
+                            if not receiver_task.done():
+                                receiver_task.cancel()
+                                tasks_to_cancel.append(receiver_task)
+                            
+                            if tasks_to_cancel:
+                                await asyncio.wait_for(
+                                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                                    timeout=2.0
+                                )
                         except:
                             pass
                         break
@@ -961,13 +1003,23 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     if not sender_ok or not receiver_ok or not progress_ok:
                         logging.warning(f"健康检查：任务状态异常 [发送:{sender_ok} 接收:{receiver_ok} 进度:{progress_ok}]，退出以便重连。")
                         try:
-                            progress_task.cancel()
-                            sender_task.cancel()
-                            receiver_task.cancel()
-                            await asyncio.wait_for(
-                                asyncio.gather(progress_task, sender_task, receiver_task, return_exceptions=True),
-                                timeout=2.0
-                            )
+                            # 只取消未完成的任务
+                            tasks_to_cancel = []
+                            if not progress_task.done():
+                                progress_task.cancel()
+                                tasks_to_cancel.append(progress_task)
+                            if not sender_task.done():
+                                sender_task.cancel()
+                                tasks_to_cancel.append(sender_task)
+                            if not receiver_task.done():
+                                receiver_task.cancel()
+                                tasks_to_cancel.append(receiver_task)
+                            
+                            if tasks_to_cancel:
+                                await asyncio.wait_for(
+                                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                                    timeout=2.0
+                                )
                         except:
                             pass
                         break
@@ -1088,8 +1140,9 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                             # 累计派发计数（按配置索引）
                             if image_idx is not None:
                                 assigned_counter_per_image[image_idx] += 1
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            log_to_web_if_available(gui_state, f"记录pending paint时出错: {e}")
+
                         logging.info(f"UID {uid} 播报绘制像素: ({x},{y}) color=({r},{g},{b}) id={paint_id}")
                         user_counters[uid] = paint_id + 1
                         cooldown_until[uid] = now + user_cooldown_seconds
@@ -1144,23 +1197,29 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             logging.info("调度循环结束（意外），等待剩余数据发送...")
 
             # 确保所有后台任务都被取消（如果还没被取消）
-            if not progress_task.cancelled():
+            # 只取消未完成的任务，避免对已完成任务调用 cancel()
+            tasks_to_cancel = []
+            if not progress_task.done():
                 progress_task.cancel()
-            if not sender_task.cancelled():
+                tasks_to_cancel.append(progress_task)
+            if not sender_task.done():
                 sender_task.cancel()
-            if not receiver_task.cancelled():
+                tasks_to_cancel.append(sender_task)
+            if not receiver_task.done():
                 receiver_task.cancel()
+                tasks_to_cancel.append(receiver_task)
 
             # 等待任务完全退出（最多等待1秒）
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(progress_task, sender_task, receiver_task, return_exceptions=True),
-                    timeout=1.0
-                )
-            except asyncio.TimeoutError:
-                logging.warning("等待后台任务退出超时，但继续清理")
-            except Exception:
-                pass
+            if tasks_to_cancel:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                        timeout=1.0
+                    )
+                except asyncio.TimeoutError:
+                    logging.warning("等待后台任务退出超时，但继续清理")
+                except Exception:
+                    pass
 
             # 等待发送队列清空
             # paint_queue 已经被移到 tool.paint_queue 实现为模块全局
@@ -1209,12 +1268,30 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
         exit_reason = "未知原因"
         
         try:
+            # 标记 GUI 状态为正在连接
+            try:
+                if gui_state is not None:
+                    with gui_state['lock']:
+                        gui_state['conn_status'] = 'connecting'
+                        gui_state['conn_reason'] = ''
+                        gui_state['server_offline'] = False
+            except Exception:
+                pass
             if reconnect_count == 1:
                 logging.info(f"初始连接 WebSocket...")
             else:
                 logging.info(f"尝试重新连接 WebSocket (第 {reconnect_count} 次尝试，累计成功连接: {successful_connections} 次，总连接时长: {total_connected_time:.1f}s)...")
             
             duration = await handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state)
+            # handle_websocket 返回表示连接持续时间，连接结束后向 GUI 报告为断开（并给出原因为空或剩余信息）
+            try:
+                if gui_state is not None:
+                    with gui_state['lock']:
+                        gui_state['conn_status'] = 'disconnected'
+                        gui_state['conn_reason'] = '连接已关闭'
+                        gui_state['server_offline'] = False
+            except Exception:
+                pass
             last_successful_duration = duration if isinstance(duration, (int, float)) else 0
             
             # 统计成功连接
@@ -1270,21 +1347,50 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
             if isinstance(e, websockets.exceptions.InvalidStatusCode):
                 exit_reason = f"服务器返回异常状态码: {err_text}"
                 logging.warning(f'{exit_reason} (第 {reconnect_count} 次尝试，已连接 {connection_duration:.1f}s)')
+                log_to_web_if_available(gui_state, f"错误: {exit_reason}")
                 # 状态码错误可能是服务器限制，使用较大退避
                 backoff = min(backoff * 2.5, backoff_max)
+                # 标记 GUI：服务器可能不可用
+                try:
+                    if gui_state is not None:
+                        with gui_state['lock']:
+                            gui_state['conn_status'] = 'disconnected'
+                            gui_state['conn_reason'] = exit_reason
+                            gui_state['server_offline'] = True
+                except Exception:
+                    pass
             elif isinstance(e, asyncio.TimeoutError):
                 exit_reason = "连接超时"
                 logging.warning(f'{exit_reason} (第 {reconnect_count} 次尝试，已连接 {connection_duration:.1f}s)')
+                log_to_web_if_available(gui_state, f"错误: {exit_reason}")
                 # 超时可能是网络问题，适度退避
                 backoff = min(backoff * 1.8, backoff_max)
+                try:
+                    if gui_state is not None:
+                        with gui_state['lock']:
+                            gui_state['conn_status'] = 'disconnected'
+                            gui_state['conn_reason'] = exit_reason
+                            gui_state['server_offline'] = True
+                except Exception:
+                    pass
             elif isinstance(e, OSError):
                 exit_reason = f"操作系统网络错误: {err_text}"
                 logging.warning(f'{exit_reason} (第 {reconnect_count} 次尝试，已连接 {connection_duration:.1f}s)')
+                log_to_web_if_available(gui_state, f"错误: {exit_reason}")
                 # OS错误通常是严重网络问题，使用较大退避
                 backoff = min(backoff * 2.0, backoff_max)
+                try:
+                    if gui_state is not None:
+                        with gui_state['lock']:
+                            gui_state['conn_status'] = 'disconnected'
+                            gui_state['conn_reason'] = exit_reason
+                            gui_state['server_offline'] = True
+                except Exception:
+                    pass
             else:
                 exit_reason = f"连接异常关闭: {err_text}"
                 logging.warning(f'{exit_reason} (第 {reconnect_count} 次尝试，已连接 {connection_duration:.1f}s)')
+                log_to_web_if_available(gui_state, f"警告: {exit_reason}")
                 # 网络相关异常，根据之前的连接时长调整
                 if last_successful_duration >= 10.0:
                     backoff = min(backoff * 1.5, backoff_max)
@@ -1297,8 +1403,17 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
             connection_duration = time.monotonic() - connection_start
             exit_reason = f"未预期异常 ({err_type}): {err_text}"
             logging.exception(f'运行过程中出现未预期异常 (第 {reconnect_count} 次尝试，已连接 {connection_duration:.1f}s)，准备重连。')
+            log_to_web_if_available(gui_state, f"严重错误: {exit_reason}")
             # 未预期异常，使用较大的退避
             backoff = min(backoff * 2.5, backoff_max)
+            try:
+                if gui_state is not None:
+                    with gui_state['lock']:
+                        gui_state['conn_status'] = 'disconnected'
+                        gui_state['conn_reason'] = exit_reason
+                        gui_state['server_offline'] = False
+            except Exception:
+                pass
 
         # 指数回退的等待；等待期间可响应停止
         wait_left = backoff
@@ -1325,13 +1440,20 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
         logging.info('run_forever 正常退出（无成功连接）。')
 
 
-def main():
-    """主函数"""
-    # 解析命令行参数（支持 -debug 和 -cli）
+def main_wrapper():
+    """包装 main 函数，以便在重启时重新执行"""
+    # 解析命令行参数（支持 -debug、-cli 和端口设置）
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('-debug', action='store_true', help='启用详细日志（DEBUG）并显示完整日志）')
-    parser.add_argument('-cli', action='store_true', help='仅命令行模式，禁用 GUI')
+    parser.add_argument('-cli', action='store_true', help='仅命令行模式，禁用 WebUI')
+    parser.add_argument('-port', type=int, default=80, help='WebUI 端口（默认 80）')
     args, _ = parser.parse_known_args()
+    
+    # 启动主逻辑
+    main(args)
+
+def main(args):
+    """主函数"""
     debug = bool(args.debug)
     cli_only = bool(args.cli)
 
@@ -1379,8 +1501,8 @@ def main():
             now_ts = int(time.time())
             # 若配置中有 access_key，则优先通过接口获取真实 token，失败再回退到配置中的 token
             if ak:
-                # 如果配置中已有 token 且 token_time 在 1 day 内，则复用并跳过请求
-                if token_from_config and token_time and (now_ts - int(token_time) < 86400):
+                # 如果配置中已有 token 且 token_time 在 1 小时内，则复用并跳过请求
+                if token_from_config and token_time and (now_ts - int(token_time) < 3600):
                     token = token_from_config
                 else:
                     fetched = None
@@ -1412,7 +1534,7 @@ def main():
                 # 无 access_key，若配置含 token 则直接使用
                 if token_from_config:
                     # 若存在 token_time 并且未过期则直接使用；否则标记当前时间并保存
-                    if token_time and (now_ts - int(token_time) < 86400):
+                    if token_time and (now_ts - int(token_time) < 3600):
                         token = token_from_config
                     else:
                         token = token_from_config
@@ -1466,16 +1588,19 @@ def main():
         logging.getLogger().setLevel(logging.DEBUG)
 
     try:
-        gui_available = False
-        start_gui_func = None
+        webui_available = False
+        start_webui_func = None
+        
         if not cli_only:
+            # 尝试加载 WebUI
             try:
-                # 动态导入 GUI 前端
-                import gui
-                start_gui_func = gui.start_gui
-                gui_available = True
+                import web_gui
+                start_webui_func = web_gui.start_web_gui
+                webui_available = True
+                logging.info("WebUI 模块已加载")
             except Exception as e:
-                logging.warning(f"GUI 不可用，回退到 CLI：{e}")
+                logging.warning(f"WebUI 不可用，将使用 CLI 模式：{e}")
+                cli_only = True
 
         # 定义刷新配置函数（仅刷新图片配置，不重新获取 token）
         def refresh_config(new_cfg: dict):
@@ -1499,9 +1624,9 @@ def main():
                     logging.warning('刷新配置时未能加载到任何图片（可能都被禁用或路径无效）。')
             except Exception:
                 logging.exception('刷新配置时加载图片失败')
-            # 如果 GUI 可用，更新 gui_state 的相关字段
+            # 如果 WebUI 可用，更新 gui_state 的相关字段
             try:
-                if gui_available:
+                if webui_available and 'gui_state' in locals():
                     with gui_state['lock']:
                         # Update gui_state even if images_data is empty so backend rebuilds its maps
                         gui_state['images_data'] = images_data
@@ -1509,25 +1634,42 @@ def main():
             except Exception:
                 logging.exception('刷新配置时更新 GUI 状态失败')
 
-        # 将刷新回调注册到 gui 模块（GUI 将调用此回调以替代重启）
+        # 将刷新回调注册到 web_gui 模块
         try:
-            if gui_available:
-                gui.REFRESH_CALLBACK = refresh_config
+            if webui_available:
+                import web_gui
+                web_gui.REFRESH_CALLBACK = refresh_config
         except Exception:
             pass
 
-        if cli_only or not gui_available:
-            # CLI/无 GUI：使用带重连的持久运行
+        if cli_only or not webui_available:
+            # CLI 模式：使用带重连的持久运行
             asyncio.run(run_forever(config, users_with_tokens, images_data, debug))
         else:
-            # GUI 模式：创建线程安全的 gui_state 并在后台运行 asyncio
+            # WebUI 模式：创建线程安全的 gui_state 并在后台运行 asyncio
             gui_state = {
                 'lock': threading.RLock(),
                 'stop': False,
                 'board_state': {},
                 'overlay': False,
                 'images_data': images_data,
+                'log_to_web': lambda msg: None, # 初始为空函数
             }
+
+            # 定义重启函数
+            def restart_app():
+                logging.info("正在执行重启...")
+                # 标记停止，以便正常关闭现有线程
+                with gui_state['lock']:
+                    gui_state['stop'] = True
+                # 等待一小段时间让线程退出
+                time.sleep(2)
+                # 使用 os.execv 重启进程
+                try:
+                    os.execv(sys.executable, ['python'] + sys.argv)
+                except Exception as e:
+                    logging.error(f"重启失败: {e}")
+                    sys.exit(1) # 如果 execv 失败，则退出
 
             def run_asyncio_loop():
                 try:
@@ -1538,19 +1680,17 @@ def main():
             t = threading.Thread(target=run_asyncio_loop, daemon=True)
             t.start()
 
-            # 启动 Tkinter GUI（主线程）
+            # 启动 WebUI（主线程）
             try:
-                start_gui_func(config, images_data, users_with_tokens, gui_state)
+                port = args.port
+                logging.info(f"准备启动 WebUI 在端口 {port}")
+                start_webui_func(config, images_data, users_with_tokens, gui_state, port=port, restart_callback=restart_app)
             finally:
-                # GUI 关闭时请求后台停止
+                # WebUI 关闭时请求后台停止
                 with gui_state['lock']:
                     gui_state['stop'] = True
                 t.join(timeout=5)
-                logging.info('GUI 退出，后台任务已请求停止。')
-    except KeyboardInterrupt:
-        logging.info("检测到手动中断，程序退出。")
-    except Exception:
-        logging.exception("程序运行时发生未捕获的异常")
+                logging.info('WebUI 退出，后台任务已请求停止。')
 
 if __name__ == "__main__":
-    main()
+    main_wrapper()

@@ -1,0 +1,797 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LSP2025 Drawer - WebUI</title>
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #f0f0f0;
+            padding: 10px;
+        }
+        
+        .container {
+            max-width: 1920px;
+            margin: 0 auto;
+            background-color: white;
+            padding: 15px;
+            border-radius: 5px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+        }
+        
+        h1 {
+            font-size: 24px;
+            margin-bottom: 15px;
+            color: #333;
+        }
+        
+        .section {
+            margin-bottom: 20px;
+            border: 1px solid #ddd;
+            padding: 15px;
+            border-radius: 5px;
+        }
+        
+        .section-title {
+            font-size: 18px;
+            font-weight: bold;
+            margin-bottom: 10px;
+            color: #555;
+        }
+        
+        /* 画板预览区域 */
+        #board-canvas-container {
+            width: 100%;
+            height: 600px;
+            overflow: hidden;
+            background-color: #222;
+            border: 2px solid #333;
+            position: relative;
+            cursor: grab;
+        }
+        
+        #board-canvas-container:active {
+            cursor: grabbing;
+        }
+        
+        #board-canvas {
+            display: block;
+            image-rendering: pixelated;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        
+        .controls {
+            margin-top: 10px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+        }
+        
+        button {
+            padding: 8px 16px;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        
+        button:hover {
+            background-color: #45a049;
+        }
+        
+        button:active {
+            background-color: #3d8b40;
+        }
+        
+        .btn-secondary {
+            background-color: #008CBA;
+        }
+        
+        .btn-secondary:hover {
+            background-color: #007399;
+        }
+        
+        .btn-danger {
+            background-color: #f44336;
+        }
+        
+        .btn-danger:hover {
+            background-color: #da190b;
+        }
+        
+        /* 进度条 */
+        .progress-container {
+            margin: 10px 0;
+        }
+        
+        .progress-bar {
+            width: 100%;
+            height: 30px;
+            background-color: #ddd;
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        
+        .progress-fill {
+            height: 100%;
+            background-color: #4CAF50;
+            transition: width 0.3s ease, background-color 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            font-weight: bold;
+        }
+        
+        .progress-fill.danger {
+            background-color: #d32f2f;
+        }
+        
+        .info-text {
+            margin: 5px 0;
+            font-size: 14px;
+            color: #333;
+        }
+        
+        /* 图片管理表格 */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+        
+        th, td {
+            border: 1px solid #ddd;
+            padding: 8px;
+            text-align: left;
+        }
+        
+        th {
+            background-color: #4CAF50;
+            color: white;
+        }
+        
+        tr:nth-child(even) {
+            background-color: #f2f2f2;
+        }
+        
+        tr:hover {
+            background-color: #ddd;
+        }
+        
+        .enabled-check {
+            color: green;
+            font-weight: bold;
+        }
+        
+        .disabled-cross {
+            color: red;
+            font-weight: bold;
+        }
+        
+        /* 模态框 */
+        .modal {
+            display: none;
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.5);
+        }
+        
+        .modal-content {
+            background-color: white;
+            margin: 10% auto;
+            padding: 20px;
+            border-radius: 5px;
+            width: 80%;
+            max-width: 500px;
+        }
+        
+        .modal-header {
+            font-size: 20px;
+            font-weight: bold;
+            margin-bottom: 15px;
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        
+        .form-group input,
+        .form-group select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .zoom-info {
+            font-size: 14px;
+            color: #666;
+            margin-left: 10px;
+        }
+        
+        .connection-status {
+            padding: 5px 10px;
+            border-radius: 3px;
+            font-size: 14px;
+            display: inline-block;
+        }
+        
+        .status-connected {
+            background-color: #4CAF50;
+            color: white;
+        }
+        
+        .status-disconnected {
+            background-color: #f44336;
+            color: white;
+        }
+        
+        .status-connecting {
+            background-color: #FF9800;
+            color: white;
+        }
+        
+        /* 拖动设置起点模态框 */
+        #drag-position-modal {
+            display: none;
+            position: fixed;
+            z-index: 2000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0,0,0,0.8);
+        }
+        
+        #drag-position-modal .modal-content {
+            background-color: #333;
+            margin: 20px auto;
+            padding: 0;
+            width: 95%;
+            max-width: 1200px;
+            height: 90%;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        #drag-position-canvas-container {
+            flex: 1;
+            background-color: #222;
+            position: relative;
+            overflow: hidden;
+            cursor: default;
+        }
+        
+        #drag-position-canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            image-rendering: pixelated;
+        }
+        
+        .drag-position-header {
+            padding: 15px;
+            background-color: #444;
+            color: white;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .drag-position-footer {
+            padding: 15px;
+            background-color: #444;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        
+        .position-info {
+            color: white;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>LSP2025 Drawer - WebUI</h1>
+        
+        <!-- 画板预览区域 -->
+        <div class="section">
+            <div class="section-title">画板预览</div>
+            <div id="board-canvas-container">
+                <canvas id="board-canvas" width="1000" height="600"></canvas>
+            </div>
+            <div class="controls">
+                <button id="toggle-overlay">👁️ 预览成果</button>
+                <button id="drag-set-position" class="btn-secondary">🎯 拖动设置起点</button>
+                <span class="zoom-info">缩放: <span id="zoom-level">100</span>% | 拖拽平移 | 滚轮缩放</span>
+            </div>
+        </div>
+        
+        <!-- 进度信息 -->
+        <div class="section">
+            <div class="section-title">绘制进度</div>
+            <div class="progress-container">
+                <div class="progress-bar">
+                    <div class="progress-fill" id="progress-fill">0.00%</div>
+                </div>
+            </div>
+            <div class="info-text" id="info-text">等待数据...</div>
+            <div class="info-text" id="users-info">可用: 0 | 就绪: 0</div>
+            <div class="info-text" id="eta-info"></div>
+            <div class="info-text">
+                连接状态: <span class="connection-status status-connecting" id="conn-status">连接中...</span>
+            </div>
+        </div>
+        
+        <!-- 图片管理 -->
+        <div class="section">
+            <div class="section-title">图片管理</div>
+            <table id="images-table">
+                <thead>
+                    <tr>
+                        <th>启用</th>
+                        <th>图片名称</th>
+                        <th>起点X</th>
+                        <th>起点Y</th>
+                        <th>宽度</th>
+                        <th>高度</th>
+                        <th>模式</th>
+                        <th>权重</th>
+                        <th>派发</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="images-tbody">
+                    <tr><td colspan="10">加载中...</td></tr>
+                </tbody>
+            </table>
+            <div class="controls">
+                <button id="refresh-images">🔄 刷新图片</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 编辑图片模态框 -->
+    <div id="edit-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">编辑图片</div>
+            <div class="form-group">
+                <label>起点 X:</label>
+                <input type="number" id="edit-x" min="0" max="999">
+            </div>
+            <div class="form-group">
+                <label>起点 Y:</label>
+                <input type="number" id="edit-y" min="0" max="599">
+            </div>
+            <div class="form-group">
+                <label>绘图模式:</label>
+                <select id="edit-mode">
+                    <option value="horizontal">horizontal</option>
+                    <option value="concentric">concentric</option>
+                    <option value="random">random</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>权重:</label>
+                <input type="number" id="edit-weight" min="0.1" max="10" step="0.1">
+            </div>
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" id="edit-enabled"> 启用
+                </label>
+            </div>
+            <div class="controls">
+                <button id="save-edit">保存</button>
+                <button id="cancel-edit" class="btn-secondary">取消</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 拖动设置起点模态框 -->
+    <div id="drag-position-modal">
+        <div class="modal-content">
+            <div class="drag-position-header">
+                <div>
+                    <span id="drag-position-title">拖动设置起点</span>
+                </div>
+                <div>
+                    <button id="close-drag-position" class="btn-danger">关闭</button>
+                </div>
+            </div>
+            <div id="drag-position-canvas-container">
+                <canvas id="drag-position-canvas" width="1000" height="600"></canvas>
+            </div>
+            <div class="drag-position-footer">
+                <div class="position-info">
+                    位置: <span id="drag-position-coords">(0, 0)</span>
+                </div>
+                <div class="controls">
+                    <button id="apply-drag-position">✓ 应用</button>
+                    <button id="cancel-drag-position" class="btn-secondary">✗ 取消</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script>
+        // WebSocket 连接
+        const socket = io();
+
+        // 全局状态
+        let currentScale = 1.0;
+        let offsetX = 0;
+        let offsetY = 0;
+        let isDragging = false;
+        let dragStartX = 0;
+        let dragStartY = 0;
+    let overlayEnabled = false;
+        let editingIndex = null;
+
+        // 拖动设置起点相关（使用缓存避免频繁 fetch）
+        let dragPositionIndex = null;
+        let dragPositionImgX = 0;
+        let dragPositionImgY = 0;
+        let dragPositionImgWidth = 0;
+        let dragPositionImgHeight = 0;
+        let dragPositionDragging = false;
+        let dragPositionStartMouseX = 0;
+        let dragPositionStartMouseY = 0;
+        let dragPositionStartImgX = 0;
+        let dragPositionStartImgY = 0;
+        let dragBaseBitmap = null;
+        let dragTargetBitmap = null;
+
+        // 历史数据用于计算增长率
+        const progressHistory = [];
+        const WINDOW_SECONDS = 60;
+
+        // Canvas 元素
+        const canvas = document.getElementById('board-canvas');
+        const ctx = canvas.getContext('2d');
+        const container = document.getElementById('board-canvas-container');
+
+        // 渲染/缓存优化
+        let pendingRedraw = false; // 标记下一帧需要 redraw
+        let lastBoardImageSrc = null;
+        let cachedBoardBitmap = null;
+
+        // 初始化画布（内部像素 1000x600），使用 CSS transform 做缩放/平移
+        function initCanvas() {
+            canvas.width = 1000;
+            canvas.height = 600;
+            canvas.style.transformOrigin = '0 0';
+            setCanvasTransform();
+            scheduleRedraw();
+        }
+
+        function scheduleRedraw() {
+            if (pendingRedraw) return;
+            pendingRedraw = true;
+            requestAnimationFrame(() => {
+                pendingRedraw = false;
+                redrawCanvas();
+            });
+        }
+
+        async function redrawCanvas() {
+            try {
+                const res = await fetch('/api/board');
+                const data = await res.json();
+                if (!data || !data.image) return;
+
+                const src = data.image;
+                if (src !== lastBoardImageSrc) {
+                    lastBoardImageSrc = src;
+                    try { if (cachedBoardBitmap && cachedBoardBitmap.close) cachedBoardBitmap.close(); } catch (e) {}
+                    // 使用 blob -> createImageBitmap 来提升性能
+                    const blob = await (await fetch('data:image/png;base64,' + src)).blob();
+                    try {
+                        cachedBoardBitmap = await createImageBitmap(blob);
+                    } catch (e) {
+                        // fallback: decode via Image
+                        const img = new Image();
+                        await new Promise((resolve) => { img.onload = resolve; img.onerror = resolve; img.src = 'data:image/png;base64,' + src; });
+                        ctx.clearRect(0,0,canvas.width,canvas.height);
+                        ctx.drawImage(img,0,0);
+                        return;
+                    }
+                }
+
+                ctx.clearRect(0,0,canvas.width,canvas.height);
+                if (cachedBoardBitmap) ctx.drawImage(cachedBoardBitmap, 0, 0, canvas.width, canvas.height);
+            } catch (err) {
+                console.error('获取画板失败:', err);
+            }
+        }
+
+        // heatmap removed on frontend
+
+        // 应用 CSS transform（统一管理）
+        function setCanvasTransform() {
+            canvas.style.transform = `translate(${offsetX}px, ${offsetY}px) scale(${currentScale})`;
+        }
+
+        // 画布拖拽（使用 container 捕获事件，更新 CSS transform）
+        container.addEventListener('mousedown', e => {
+            isDragging = true;
+            dragStartX = e.clientX;
+            dragStartY = e.clientY;
+            container.style.cursor = 'grabbing';
+        });
+
+        container.addEventListener('mousemove', e => {
+            if (!isDragging) return;
+            const dx = e.clientX - dragStartX;
+            const dy = e.clientY - dragStartY;
+            offsetX += dx;
+            offsetY += dy;
+
+            const canvasDisplayWidth = 1000 * currentScale;
+            const canvasDisplayHeight = 600 * currentScale;
+            const containerWidth = container.clientWidth;
+            const containerHeight = container.clientHeight;
+            const minOffsetX = -canvasDisplayWidth + 100;
+            const minOffsetY = -canvasDisplayHeight + 100;
+            const maxOffsetX = containerWidth - 100;
+            const maxOffsetY = containerHeight - 100;
+            offsetX = Math.max(minOffsetX, Math.min(maxOffsetX, offsetX));
+            offsetY = Math.max(minOffsetY, Math.min(maxOffsetY, offsetY));
+
+            setCanvasTransform();
+            dragStartX = e.clientX;
+            dragStartY = e.clientY;
+        });
+
+        container.addEventListener('mouseup', () => { isDragging = false; container.style.cursor = 'grab'; });
+        container.addEventListener('mouseleave', () => { isDragging = false; container.style.cursor = 'grab'; });
+
+        // 滚轮缩放（保留鼠标焦点）
+        container.addEventListener('wheel', e => {
+            e.preventDefault();
+            const delta = e.deltaY > 0 ? 0.9 : 1.1;
+            const oldScale = currentScale;
+            currentScale = Math.max(0.1, Math.min(5.0, currentScale * delta));
+            const rect = container.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
+            offsetX = mouseX - (mouseX - offsetX) * (currentScale / oldScale);
+            offsetY = mouseY - (mouseY - offsetY) * (currentScale / oldScale);
+            setCanvasTransform();
+            document.getElementById('zoom-level').textContent = Math.round(currentScale * 100);
+            scheduleRedraw();
+        });
+
+        // 切换预览
+        document.getElementById('toggle-overlay').addEventListener('click', () => {
+            fetch('/api/overlay/toggle', { method: 'POST' })
+                .then(res => res.json())
+                .then(data => { overlayEnabled = data.overlay; scheduleRedraw(); })
+                .catch(err => console.error('切换预览失败:', err));
+        });
+
+        // heatmap control removed
+
+        // 更新状态信息
+        function updateStatus() {
+            fetch('/api/status')
+                .then(res => res.json())
+                .then(data => {
+                    const total = data.total || 0;
+                    const mismatched = data.mismatched || 0;
+                    const completed = Math.max(0, total - mismatched);
+                    const pct = total > 0 ? (completed / total * 100) : 100;
+                    const fill = document.getElementById('progress-fill');
+                    fill.style.width = pct + '%';
+                    fill.textContent = pct.toFixed(2) + '%';
+                    const now = Date.now() / 1000;
+                    progressHistory.push({ time: now, pct: pct });
+                    while (progressHistory.length > 0 && (now - progressHistory[0].time > WINDOW_SECONDS)) progressHistory.shift();
+                    let growthStr = '增长: --';
+                    let etaStr = '';
+                    let isDanger = false;
+                    if (progressHistory.length >= 2) {
+                        const first = progressHistory[0];
+                        const last = progressHistory[progressHistory.length - 1];
+                        const dt = Math.max(0.000001, last.time - first.time);
+                        const growth = (last.pct - first.pct) / dt;
+                        growthStr = `增长: ${growth >= 0 ? '+' : ''}${growth.toFixed(2)}%/s`;
+                        if (growth > 0.000001) {
+                            const remainPct = Math.max(0, 100 - pct);
+                            const etaSec = remainPct / growth;
+                            if (etaSec >= 3600) { const h = Math.floor(etaSec / 3600); const m = Math.floor((etaSec % 3600) / 60); etaStr = `估计剩余: ${h}h${m}m`; }
+                            else if (etaSec >= 60) { const m = Math.floor(etaSec / 60); const s = Math.floor(etaSec % 60); etaStr = `估计剩余: ${m}m${s}s`; }
+                            else { etaStr = `估计剩余: ${Math.floor(etaSec)}s`; }
+                        } else if (pct < 95) { isDanger = true; etaStr = '估计剩余: 我们正在被攻击，无法抵抗'; fill.classList.add('danger'); }
+                        else { etaStr = '估计剩余: 即将完成'; }
+                        if (!isDanger && growth >= 0) fill.classList.remove('danger');
+                    }
+                    const resistStr = data.resistance_pct != null ? `抵抗率: ${data.resistance_pct.toFixed(1)}%` : '抵抗率: --';
+                    document.getElementById('info-text').textContent = `进度: ${pct.toFixed(2)}% | 总: ${total} | 未达标: ${mismatched} | ${resistStr} | ${growthStr}`;
+                    document.getElementById('users-info').textContent = `可用: ${data.available || 0} | 就绪: ${data.ready_count || 0}`;
+                    document.getElementById('eta-info').textContent = etaStr;
+                    const connStatus = document.getElementById('conn-status');
+                    if (data.conn_status === 'connected') {
+                        const duration = Math.floor(Date.now() / 1000 - (data.conn_since || 0));
+                        const h = Math.floor(duration / 3600); const m = Math.floor((duration % 3600) / 60); const s = duration % 60;
+                        connStatus.textContent = `已连接 ${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`;
+                        connStatus.className = 'connection-status status-connected';
+                    } else if (data.conn_status === 'connecting') { connStatus.textContent = '连接中...'; connStatus.className = 'connection-status status-connecting'; }
+                    else { connStatus.textContent = `断开 [${data.conn_reason || '未知原因'}]`; connStatus.className = 'connection-status status-disconnected'; }
+                    if (data.server_offline) connStatus.textContent += '（服务器离线）';
+                })
+                .catch(err => console.error('更新状态失败:', err));
+        }
+
+        // 加载图片列表
+        function loadImages() {
+            fetch('/api/images')
+                .then(res => res.json())
+                .then(data => {
+                    const tbody = document.getElementById('images-tbody');
+                    tbody.innerHTML = '';
+                    data.images.forEach(img => {
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${img.enabled ? '<span class="enabled-check">✓</span>' : '<span class="disabled-cross">✗</span>'}</td>
+                            <td>${img.name}</td>
+                            <td>${img.start_x}</td>
+                            <td>${img.start_y}</td>
+                            <td>${img.width}</td>
+                            <td>${img.height}</td>
+                            <td>${img.draw_mode}</td>
+                            <td>${img.weight}</td>
+                            <td>${img.assigned}</td>
+                            <td>
+                                <button onclick="editImage(${img.index})">编辑</button>
+                                <button onclick="toggleImage(${img.index})" class="btn-secondary">切换</button>
+                                <button onclick="deleteImage(${img.index})" class="btn-danger">删除</button>
+                            </td>
+                        `;
+                        tbody.appendChild(row);
+                    });
+                })
+                .catch(err => console.error('加载图片列表失败:', err));
+        }
+
+        function toggleImage(index) {
+            fetch('/api/images/toggle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index: index }) })
+                .then(res => res.json()).then(() => { loadImages(); scheduleRedraw(); }).catch(err => console.error('切换图片失败:', err));
+        }
+
+        function editImage(index) {
+            fetch('/api/images').then(res => res.json()).then(data => {
+                const img = data.images.find(i => i.index === index); if (!img) return;
+                editingIndex = index;
+                document.getElementById('edit-x').value = img.start_x;
+                document.getElementById('edit-y').value = img.start_y;
+                document.getElementById('edit-mode').value = img.draw_mode;
+                document.getElementById('edit-weight').value = img.weight;
+                document.getElementById('edit-enabled').checked = img.enabled;
+                document.getElementById('edit-modal').style.display = 'block';
+            }).catch(err => console.error('获取图片信息失败:', err));
+        }
+
+        document.getElementById('save-edit').addEventListener('click', () => {
+            if (editingIndex === null) return;
+            const data = { index: editingIndex, start_x: parseInt(document.getElementById('edit-x').value), start_y: parseInt(document.getElementById('edit-y').value), draw_mode: document.getElementById('edit-mode').value, weight: parseFloat(document.getElementById('edit-weight').value), enabled: document.getElementById('edit-enabled').checked };
+            fetch('/api/images/edit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) })
+                .then(res => res.json()).then(() => { document.getElementById('edit-modal').style.display = 'none'; loadImages(); scheduleRedraw(); }).catch(err => console.error('保存编辑失败:', err));
+        });
+
+        document.getElementById('cancel-edit').addEventListener('click', () => { document.getElementById('edit-modal').style.display = 'none'; editingIndex = null; });
+
+        function deleteImage(index) { if (!confirm('确定要删除这个图片吗?')) return; fetch('/api/images/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index: index }) }).then(res => res.json()).then(() => { loadImages(); scheduleRedraw(); }).catch(err => console.error('删除图片失败:', err)); }
+
+        document.getElementById('refresh-images').addEventListener('click', () => { loadImages(); scheduleRedraw(); });
+
+        // 拖动设置起点功能：打开时缓存底图和目标图，mousemove 只做本地绘制
+        document.getElementById('drag-set-position').addEventListener('click', () => {
+            fetch('/api/images').then(res => res.json()).then(data => {
+                if (data.images.length === 0) { alert('请先添加至少一个图片'); return; }
+                if (data.images.length === 1) { openDragPositionModal(0); return; }
+                const selected = prompt(`请输入要调整的图片编号 (0-${data.images.length - 1}):\n\n` + data.images.map((img, i) => `${i}. ${img.name}`).join('\n'));
+                if (selected !== null) { const index = parseInt(selected); if (!isNaN(index) && index >= 0 && index < data.images.length) openDragPositionModal(index); else alert('无效的编号'); }
+            }).catch(err => console.error('获取图片列表失败:', err));
+        });
+
+        async function openDragPositionModal(index) {
+            dragPositionIndex = index;
+            try {
+                // 并行获取预览与画板
+                const [previewRes, boardRes] = await Promise.all([fetch(`/api/images/${index}/preview`), fetch('/api/board')]);
+                const preview = await previewRes.json();
+                const board = await boardRes.json();
+                dragPositionImgX = preview.start_x; dragPositionImgY = preview.start_y; dragPositionImgWidth = preview.width; dragPositionImgHeight = preview.height;
+                document.getElementById('drag-position-modal').style.display = 'block';
+
+                // 创建 bitmap 缓存
+                try { if (dragBaseBitmap && dragBaseBitmap.close) dragBaseBitmap.close(); } catch (e) {}
+                try { if (dragTargetBitmap && dragTargetBitmap.close) dragTargetBitmap.close(); } catch (e) {}
+                const baseBlob = await (await fetch('data:image/png;base64,' + board.image)).blob();
+                dragBaseBitmap = await createImageBitmap(baseBlob);
+                const targetBlob = await (await fetch('data:image/png;base64,' + preview.image)).blob();
+                dragTargetBitmap = await createImageBitmap(targetBlob);
+
+                redrawDragPositionCached();
+            } catch (err) { console.error('获取图片预览或画板失败:', err); }
+        }
+
+        function redrawDragPositionCached() {
+            const dragCanvas = document.getElementById('drag-position-canvas');
+            const dragCtx = dragCanvas.getContext('2d');
+            dragCtx.clearRect(0,0,dragCanvas.width,dragCanvas.height);
+            if (dragBaseBitmap) dragCtx.drawImage(dragBaseBitmap, 0, 0);
+            if (dragTargetBitmap) dragCtx.drawImage(dragTargetBitmap, dragPositionImgX, dragPositionImgY);
+            dragCtx.strokeStyle = 'red'; dragCtx.lineWidth = 2;
+            dragCtx.strokeRect(dragPositionImgX, dragPositionImgY, dragPositionImgWidth, dragPositionImgHeight);
+            dragCtx.fillStyle = 'yellow'; dragCtx.font = '14px Arial'; dragCtx.fillText(`(${dragPositionImgX}, ${dragPositionImgY})`, dragPositionImgX + 5, dragPositionImgY + 20);
+            document.getElementById('drag-position-coords').textContent = `(${dragPositionImgX}, ${dragPositionImgY})`;
+        }
+
+        const dragPosCanvas = document.getElementById('drag-position-canvas');
+        dragPosCanvas.addEventListener('mousedown', e => {
+            const rect = dragPosCanvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left; const mouseY = e.clientY - rect.top;
+            if (mouseX >= dragPositionImgX && mouseX <= dragPositionImgX + dragPositionImgWidth && mouseY >= dragPositionImgY && mouseY <= dragPositionImgY + dragPositionImgHeight) {
+                dragPositionDragging = true; dragPositionStartMouseX = mouseX; dragPositionStartMouseY = mouseY; dragPositionStartImgX = dragPositionImgX; dragPositionStartImgY = dragPositionImgY; dragPosCanvas.style.cursor = 'move';
+            }
+        });
+
+        dragPosCanvas.addEventListener('mousemove', e => {
+            if (!dragPositionDragging) return;
+            const rect = dragPosCanvas.getBoundingClientRect();
+            const mouseX = e.clientX - rect.left; const mouseY = e.clientY - rect.top;
+            const dx = mouseX - dragPositionStartMouseX; const dy = mouseY - dragPositionStartMouseY;
+            dragPositionImgX = Math.max(0, Math.min(1000 - dragPositionImgWidth, dragPositionStartImgX + dx));
+            dragPositionImgY = Math.max(0, Math.min(600 - dragPositionImgHeight, dragPositionStartImgY + dy));
+            redrawDragPositionCached();
+        });
+
+        dragPosCanvas.addEventListener('mouseup', () => { dragPositionDragging = false; dragPosCanvas.style.cursor = 'default'; });
+        dragPosCanvas.addEventListener('mouseleave', () => { dragPositionDragging = false; dragPosCanvas.style.cursor = 'default'; });
+
+        document.getElementById('apply-drag-position').addEventListener('click', () => {
+            fetch(`/api/images/${dragPositionIndex}/position`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ start_x: dragPositionImgX, start_y: dragPositionImgY }) })
+                .then(res => res.json()).then(() => { document.getElementById('drag-position-modal').style.display = 'none'; loadImages(); scheduleRedraw(); }).catch(err => console.error('应用位置失败:', err));
+        });
+
+        document.getElementById('cancel-drag-position').addEventListener('click', () => { document.getElementById('drag-position-modal').style.display = 'none'; });
+        document.getElementById('close-drag-position').addEventListener('click', () => { document.getElementById('drag-position-modal').style.display = 'none'; });
+
+        // WebSocket 实时更新（目前不主动使用，但保留）
+        socket.on('status_update', data => {});
+
+        // 初始化并启动定时任务
+        initCanvas(); loadImages(); updateStatus();
+        setInterval(updateStatus, 1000);
+        setInterval(scheduleRedraw, 4000); // 每4秒调度一次重绘（实际有缓存避免重复解码）
+        setInterval(loadImages, 5000);
+    </script>
+</body>
+</html>

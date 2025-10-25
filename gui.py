@@ -136,15 +136,23 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
         except Exception:
             pass
 
-    # 顶部：画板预览（自适应大小，支持拖拽和缩放）
-    preview_frame = ttk.LabelFrame(main_frame, text="画板预览 (滚轮缩放 | 拖拽平移)")
+    # 顶部预览：创建独立的预览窗口（Toplevel），以保持操作窗口专注于控制与配置
+    preview_win = tk.Toplevel()
+    preview_win.title("画板预览")
+    # 让预览窗口默认靠主窗口右侧显示（在大多数屏幕上友好）
+    try:
+        preview_win.geometry("1024x680+600+50")
+    except Exception:
+        pass
+
+    preview_frame = ttk.LabelFrame(preview_win, text="画板预览 (滚轮缩放 | 拖拽平移)")
     preview_frame.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
-    # 预览画布容器
+    # 预览画布容器（放在独立窗口内）
     preview_container = ttk.Frame(preview_frame)
     preview_container.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-    
-    # 画布状态
+
+    # 画布状态（与原实现兼容）
     canvas_state = {
         'scale': preview_scale,  # 当前缩放比例
         'offset_x': 0,           # X方向偏移
@@ -155,36 +163,38 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
         'canvas_width': 400,     # 画布显示宽度
         'canvas_height': 300     # 画布显示高度
     }
-    
+
     canvas = tk.Canvas(preview_container, bg="#222", highlightthickness=0)
     canvas.pack(fill=tk.BOTH, expand=True)
-    
-    # 缩放信息标签
+
+    # 缩放信息标签（放在预览窗口底部）
     scale_info_label = ttk.Label(preview_frame, text=f"缩放: {int(preview_scale*100)}%", foreground='gray')
     scale_info_label.pack(side=tk.BOTTOM, pady=2)
-    
+
     # 自适应画布大小
     def update_canvas_size(event=None):
         canvas_state['canvas_width'] = canvas.winfo_width()
         canvas_state['canvas_height'] = canvas.winfo_height()
         # 初次加载时，自动调整缩放以适应窗口
         if canvas_state['canvas_width'] > 1 and canvas_state['scale'] == 0.25:
-            # 计算合适的缩放比例
             scale_w = canvas_state['canvas_width'] / BOARD_W
             scale_h = canvas_state['canvas_height'] / BOARD_H
             canvas_state['scale'] = min(scale_w, scale_h, 1.0)
-            scale_info_label.config(text=f"缩放: {int(canvas_state['scale']*100)}%")
+            try:
+                scale_info_label.config(text=f"缩放: {int(canvas_state['scale']*100)}%")
+            except Exception:
+                pass
         redraw()
-    
+
     canvas.bind('<Configure>', update_canvas_size)
-    
-    # 鼠标拖拽功能
+
+    # 鼠标拖拽功能（保持原函数语义）
     def on_canvas_press(event):
         canvas_state['dragging'] = True
         canvas_state['drag_start_x'] = event.x
         canvas_state['drag_start_y'] = event.y
         canvas.config(cursor='fleur')
-    
+
     def on_canvas_drag(event):
         if canvas_state['dragging']:
             dx = event.x - canvas_state['drag_start_x']
@@ -195,42 +205,49 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             canvas_state['drag_start_y'] = event.y
             constrain_offset()
             redraw()
-    
+
     def on_canvas_release(event):
         canvas_state['dragging'] = False
         canvas.config(cursor='')
-    
-    # 鼠标滚轮缩放
+
     def on_canvas_wheel(event):
-        # 获取鼠标位置
         mouse_x = event.x
         mouse_y = event.y
-        
-        # 计算缩放前鼠标指向的图像坐标
         old_scale = canvas_state['scale']
         img_x = (mouse_x - canvas_state['offset_x']) / old_scale
         img_y = (mouse_y - canvas_state['offset_y']) / old_scale
-        
-        # 调整缩放
         if event.delta > 0:
             canvas_state['scale'] *= 1.1
         else:
             canvas_state['scale'] /= 1.1
-        
-        # 限制缩放范围
         canvas_state['scale'] = max(0.1, min(5.0, canvas_state['scale']))
-        
-        # 调整偏移以保持鼠标位置不变
         canvas_state['offset_x'] = mouse_x - img_x * canvas_state['scale']
         canvas_state['offset_y'] = mouse_y - img_y * canvas_state['scale']
-        
-        scale_info_label.config(text=f"缩放: {int(canvas_state['scale']*100)}%")
-    
-    
+        try:
+            scale_info_label.config(text=f"缩放: {int(canvas_state['scale']*100)}%")
+        except Exception:
+            pass
+
     canvas.bind('<Button-1>', on_canvas_press)
     canvas.bind('<B1-Motion>', on_canvas_drag)
     canvas.bind('<ButtonRelease-1>', on_canvas_release)
     canvas.bind('<MouseWheel>', on_canvas_wheel)
+
+    # 热力图相关
+    heatmap_on = False
+
+    def toggle_heatmap():
+        nonlocal heatmap_on
+        heatmap_on = not heatmap_on
+        redraw()
+
+    # 热力图功能已移除，仍保留预览按钮区域（pv_btn_frame）创建以便后续按钮使用
+    try:
+        if 'pv_btn_frame' not in locals():
+            pv_btn_frame = ttk.Frame(preview_frame)
+            pv_btn_frame.pack(fill=tk.X, padx=5, pady=3)
+    except Exception:
+        pass
 
     # 中部：进度信息（紧凑布局）
     info_frame = ttk.LabelFrame(main_frame, text="绘制进度")
@@ -258,6 +275,10 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
 
     eta_lbl = ttk.Label(info_frame, text='', anchor='w')
     eta_lbl.pack(fill=tk.X, pady=2, padx=5)
+
+    # 连接状态显示（断开/已连接/服务器离线）
+    connection_lbl = ttk.Label(info_frame, text='连接: 未知', anchor='w', foreground='purple')
+    connection_lbl.pack(fill=tk.X, pady=2, padx=5)
 
     # 底部：图片管理（可折叠）
     images_frame = ttk.LabelFrame(main_frame, text="图片管理")
@@ -832,6 +853,19 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
     
     ttk.Button(ctrl_btn_frame, text='🎯 拖动设置起点', command=open_drag_window).pack(side=tk.LEFT, padx=2)
 
+    # 预览窗口的快速按钮区（包含预览/拖动/热力图）
+    try:
+        # pv_btn_frame 可能已在前面创建
+        if 'pv_btn_frame' not in locals():
+            pv_btn_frame = ttk.Frame(preview_frame)
+            pv_btn_frame.pack(fill=tk.X, padx=5, pady=3)
+        ttk.Button(pv_btn_frame, text='👁️ 预览成果', command=toggle_overlay).pack(side=tk.LEFT, padx=2)
+        ttk.Button(pv_btn_frame, text='🎯 拖动设置起点', command=open_drag_window).pack(side=tk.LEFT, padx=2)
+        # 热力图按钮可能已由上面代码加入，但为保险在此确保存在
+        # heatmap button removed
+    except Exception:
+        pass
+
     # 缓存的底图与时间戳
     cached = {
         'base_img': None,
@@ -907,7 +941,48 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             draw.rectangle([x0, y0, x1-1, y1-1], outline='red', width=2)
 
         # 根据当前缩放和偏移进行变换
+        # 如果开启热力图，则在绘制 overlay 之后叠加热力图
+        # Heatmap feature removed from backend; keep hits empty to avoid lookups
+        hits = {}
+
         scale = canvas_state['scale']
+
+        # 生成并叠加热力图（在缩放前，使用原始大小）
+        if heatmap_on and hits:
+            try:
+                from PIL import Image as _Image
+                heat = _Image.new('RGBA', (BOARD_W, BOARD_H), (0,0,0,0))
+                px = heat.load()
+                # color mapping: 0 -> green, max(20) -> red
+                MAX_HITS = 20
+                for pos, dq in hits.items():
+                    try:
+                        cnt = len(dq) if hasattr(dq, '__len__') else 0
+                        if cnt <= 0:
+                            continue
+                        x, y = pos
+                        c = min(cnt, MAX_HITS)
+                        ratio = c / float(MAX_HITS)
+                        # interpolate green->red
+                        r = int(255 * ratio)
+                        g = int(255 * (1.0 - ratio))
+                        a = int(160 * min(1.0, ratio + 0.15))
+                        if 0 <= x < BOARD_W and 0 <= y < BOARD_H:
+                            try:
+                                px[x, y] = (r, g, 0, a)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                # 叠加热力图到 img（RGBA 合成）
+                try:
+                    img = img.convert('RGBA')
+                    img = Image.alpha_composite(img, heat)
+                    img = img.convert('RGB')
+                except Exception:
+                    pass
+            except Exception:
+                pass
         if scale != 1.0:
             new_w = int(BOARD_W * scale)
             new_h = int(BOARD_H * scale)
@@ -957,6 +1032,10 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             ready = int(gui_state.get('ready_count', 0))
             resistance_pct = gui_state.get('resistance_pct', None)
             num_images = len(gui_state.get('images_data', []))
+            conn_status = gui_state.get('conn_status')
+            conn_since = gui_state.get('conn_since')
+            conn_reason = gui_state.get('conn_reason')
+            server_offline = bool(gui_state.get('server_offline', False))
 
         pct = 100.0 if total <= 0 else max(0.0, min(100.0, (total - mismatched) * 100.0 / max(1, total)))
         progress_var.set(pct)
@@ -1029,16 +1108,51 @@ def start_gui(config, images_data, users_with_tokens, gui_state):
             users_lbl.config(text=f"可用: {available} | 就绪: {ready}")
         except Exception:
             pass
+        # 更新连接状态显示
+        try:
+            status_text = '连接: 未知'
+            if conn_status == 'connected' and conn_since:
+                # conn_since is stored as epoch seconds (int(time.time()))
+                dur = int(time.time() - float(conn_since))
+                h = dur // 3600
+                m = (dur % 3600) // 60
+                s = dur % 60
+                status_text = f"已连接 {h:02d}:{m:02d}:{s:02d}"
+            elif conn_status == 'connecting':
+                status_text = '连接中...'
+            elif conn_status == 'disconnected':
+                reason = conn_reason or '未知原因'
+                status_text = f'断开 [{reason}]'
+            if server_offline:
+                status_text += '（服务器离线）'
+            connection_lbl.config(text=status_text)
+        except Exception:
+            pass
 
     def tick():
         update_status()
-        redraw()
+        # status updates remain at 1s cadence
         root.after(1000, tick)
+
+    # 预览重绘周期：同步为 user_cooldown_seconds
+    def preview_tick():
+        try:
+            cooldown = int(config.get('user_cooldown_seconds', 1))
+            redraw()
+            preview_win.after(max(100, cooldown * 1000), preview_tick)
+        except Exception:
+            # 保证即使出错也能继续尝试
+            preview_win.after(1000, preview_tick)
 
     # 初始化
     refresh_tree()
     cached['last_build'] = 0
     tick()
+    # 启动预览独立刷新周期（基于 user_cooldown_seconds）
+    try:
+        preview_tick()
+    except Exception:
+        pass
 
     root.protocol('WM_DELETE_WINDOW', root.destroy)
     root.mainloop()
