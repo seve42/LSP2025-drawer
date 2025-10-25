@@ -30,7 +30,7 @@
 
 **安装依赖：**
 ```powershell
-pip install -r requirements_webui.txt
+pip install -r requirements.txt
 ```
 
 **启动 WebUI：**
