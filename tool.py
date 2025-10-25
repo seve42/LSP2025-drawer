@@ -139,9 +139,7 @@ async def send_paint_data(ws, interval_ms):
                         # 不退出任务，继续循环（上下文会在连接真正断开时自动取消任务）
                         err_msg = str(e) if str(e) else e.__class__.__name__
                         logging.debug(f"发送时连接关闭: {err_msg}，数据已重新入队")
-                        # 尝试触发与前端 "重启后端" 相同的回调（如果可用）
-                        # 这会调用 web_gui 中注册的 MAIN_RESTART_CALLBACK，以后台线程执行，模拟前端操作
-
+                        
                         try:
                             filtered_data = filter_pong_from_data(merged_data)
                             if filtered_data:
@@ -150,24 +148,6 @@ async def send_paint_data(ws, interval_ms):
                                 logging.debug("过滤后没有需要重新入队的数据")
                         except Exception as e2:
                             logging.debug(f"重新入队时出错: {e2}")
-
-                            
-                        try:
-                            import threading as _threading
-                            try:
-                                import web_gui as _web_gui
-                                cb = getattr(_web_gui, 'MAIN_RESTART_CALLBACK', None)
-                                if cb:
-                                    _threading.Thread(target=lambda: cb(), daemon=True).start()
-                                    logging.info("已触发 MAIN_RESTART_CALLBACK（重启后端回调）。")
-                                else:
-                                    logging.debug("未找到 MAIN_RESTART_CALLBACK，未触发后端重启。")
-                            except Exception as _e:
-                                logging.debug(f"无法导入或调用 web_gui.MAIN_RESTART_CALLBACK: {_e}")
-                        except Exception:
-                            pass
-                        
-                        
                     except asyncio.TimeoutError:
                         # 发送超时，过滤掉 Pong 后重新入队
                         logging.debug(f"发送超时，数据已重新入队")
