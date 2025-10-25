@@ -586,15 +586,16 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                 opcode = data[offset]
                                 offset += 1
                                 if opcode == 0xfc:  # Heartbeat Ping
-                                    # 【关键修复】心跳响应必须通过粘包队列发送（遵循协议）
-                                    # 但必须确保 Pong 不会在连接断开后被重新入队，避免 "unexpected pong" 错误
-                                    logging.debug("收到 Ping，将 Pong 加入粘包队列。")
+                                    # 【根本修复】Pong 必须立即单独发送，不能通过粘包队列
+                                    # 文档示例明确显示：ws.send(new Uint8Array([0xfb]))
+                                    # 粘包机制仅用于绘画操作的优化，心跳必须实时响应
+                                    logging.debug("收到 Ping，立即发送 Pong。")
                                     try:
-                                        tool.append_to_queue(bytes([0xfb]))
+                                        await ws.send(bytes([0xfb]))
                                         consecutive_errors = 0  # 成功处理心跳后重置错误计数
                                     except Exception as e:
                                         err_msg = str(e) if str(e) else e.__class__.__name__
-                                        logging.warning(f"处理 Pong 时出错: {err_msg}")
+                                        logging.warning(f"发送 Pong 时出错: {err_msg}")
                                         consecutive_errors += 1
                                         if consecutive_errors >= max_consecutive_errors:
                                             logging.error("心跳处理连续失败，接收任务退出。")

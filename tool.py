@@ -115,41 +115,17 @@ async def paint(ws, uid, token, r, g, b, x, y, paint_id):
 async def send_paint_data(ws, interval_ms):
     """定时发送粘合后的绘画数据包（后台任务）
     
-    关键修改：
-    - 连接断开时不立即退出，而是保持重试
-    - 捕获所有异常并尝试恢复
-    - 只有在被取消或达到最大错误次数时才退出
+    【关键修复】此任务应持续运行直到被取消（WebSocket 上下文结束时自动取消）
+    不应该因为临时的发送错误而退出，因为：
+    1. WebSocket 上下文会管理连接生命周期
+    2. 如果连接真的断开，上下文会自动退出并取消此任务
+    3. 如果此任务提前退出，Pong 将永远无法发送，导致 Ping timeout
     """
-    consecutive_errors = 0
-    max_consecutive_errors = 15  # 增加容错次数到15次
-    
     try:
         while True:
             await asyncio.sleep(interval_ms / 1000.0)
             
-            # 检查连接状态
-            try:
-                is_open = getattr(ws, "open", None)
-                if is_open is None:
-                    is_open = not getattr(ws, "closed", False)
-            except Exception:
-                is_open = False
-                
-            # 如果连接断开，不立即退出，继续等待（主循环会处理重连）
-            if not is_open:
-                logging.debug("发送任务检测到连接断开，等待重连...")
-                consecutive_errors += 1
-                if consecutive_errors >= max_consecutive_errors:
-                    logging.warning(f"连接持续断开达{consecutive_errors}次，发送任务退出。")
-                    break
-                await asyncio.sleep(1.0)
-                continue
-            
-            # 连接正常，重置错误计数
-            if consecutive_errors > 0:
-                logging.info(f"连接已恢复，重置错误计数（之前: {consecutive_errors}）")
-                consecutive_errors = 0
-                
+            # 检查是否有数据需要发送
             if paint_queue:
                 merged_data = get_merged_data()
                 if merged_data:
@@ -159,85 +135,75 @@ async def send_paint_data(ws, interval_ms):
                     except (websockets.exceptions.ConnectionClosed, 
                             websockets.exceptions.ConnectionClosedError, 
                             websockets.exceptions.ConnectionClosedOK) as e:
-                        # 连接关闭，过滤掉 Pong 后重新入队数据，继续循环等待重连
+                        # 连接关闭，过滤掉 Pong 后重新入队数据
+                        # 不退出任务，继续循环（上下文会在连接真正断开时自动取消任务）
                         err_msg = str(e) if str(e) else e.__class__.__name__
-                        logging.warning(f"发送时连接关闭: {err_msg}，数据已重新入队")
-                        consecutive_errors += 1
+                        logging.debug(f"发送时连接关闭: {err_msg}，数据已重新入队")
+                        # 尝试触发与前端 "重启后端" 相同的回调（如果可用）
+                        # 这会调用 web_gui 中注册的 MAIN_RESTART_CALLBACK，以后台线程执行，模拟前端操作
+
                         try:
-                            # 【关键修复】过滤掉 Pong，避免在重连后发送旧的 Pong 导致 "unexpected pong" 错误
                             filtered_data = filter_pong_from_data(merged_data)
                             if filtered_data:
                                 append_to_queue(filtered_data)
                             else:
                                 logging.debug("过滤后没有需要重新入队的数据")
-                        except Exception:
+                        except Exception as e2:
+                            logging.debug(f"重新入队时出错: {e2}")
+
+                            
+                        try:
+                            import threading as _threading
                             try:
-                                filtered_data = filter_pong_from_data(merged_data)
-                                if filtered_data:
-                                    paint_queue.insert(0, filtered_data)
-                            except Exception as insert_err:
-                                logging.error(f"无法保存数据: {insert_err}")
-                        await asyncio.sleep(1.0)
-                    except asyncio.TimeoutError as e:
+                                import web_gui as _web_gui
+                                cb = getattr(_web_gui, 'MAIN_RESTART_CALLBACK', None)
+                                if cb:
+                                    _threading.Thread(target=lambda: cb(), daemon=True).start()
+                                    logging.info("已触发 MAIN_RESTART_CALLBACK（重启后端回调）。")
+                                else:
+                                    logging.debug("未找到 MAIN_RESTART_CALLBACK，未触发后端重启。")
+                            except Exception as _e:
+                                logging.debug(f"无法导入或调用 web_gui.MAIN_RESTART_CALLBACK: {_e}")
+                        except Exception:
+                            pass
+                        
+                        
+                    except asyncio.TimeoutError:
                         # 发送超时，过滤掉 Pong 后重新入队
-                        logging.warning(f"发送超时，数据已重新入队")
-                        consecutive_errors += 1
+                        logging.debug(f"发送超时，数据已重新入队")
                         try:
                             filtered_data = filter_pong_from_data(merged_data)
                             if filtered_data:
                                 append_to_queue(filtered_data)
-                        except Exception:
-                            try:
-                                filtered_data = filter_pong_from_data(merged_data)
-                                if filtered_data:
-                                    paint_queue.insert(0, filtered_data)
-                            except Exception:
-                                pass
-                        await asyncio.sleep(1.0)
+                        except Exception as e2:
+                            logging.debug(f"重新入队时出错: {e2}")
                     except asyncio.CancelledError:
-                        # 任务被取消，过滤掉 Pong 后保存数据并退出
-                        logging.info("发送任务被取消，保存数据")
+                        # 任务被取消（WebSocket 上下文结束），过滤掉 Pong 后保存数据并退出
+                        logging.debug("发送任务被取消")
                         try:
                             filtered_data = filter_pong_from_data(merged_data)
                             if filtered_data:
                                 append_to_queue(filtered_data)
                         except Exception:
-                            try:
-                                filtered_data = filter_pong_from_data(merged_data)
-                                if filtered_data:
-                                    paint_queue.insert(0, filtered_data)
-                            except Exception:
-                                pass
+                            pass
                         raise
                     except Exception as e:
                         # 其他异常，过滤掉 Pong 后重新入队并继续
                         err_msg = str(e) if str(e) else e.__class__.__name__
                         err_type = e.__class__.__name__
-                        logging.error(f"发送时出错 ({err_type}): {err_msg}")
-                        consecutive_errors += 1
+                        logging.debug(f"发送时出错 ({err_type}): {err_msg}，数据已重新入队")
                         try:
                             filtered_data = filter_pong_from_data(merged_data)
                             if filtered_data:
                                 append_to_queue(filtered_data)
-                        except Exception:
-                            try:
-                                filtered_data = filter_pong_from_data(merged_data)
-                                if filtered_data:
-                                    paint_queue.insert(0, filtered_data)
-                            except Exception:
-                                pass
-                        await asyncio.sleep(1.0)
-                    
-                    # 达到最大错误次数时退出
-                    if consecutive_errors >= max_consecutive_errors:
-                        logging.error(f"连续错误{consecutive_errors}次，发送任务退出")
-                        break
+                        except Exception as e2:
+                            logging.debug(f"重新入队时出错: {e2}")
     except asyncio.CancelledError:
-        logging.debug("发送任务被取消")
+        logging.debug("发送任务被取消（正常退出）")
         raise
     except Exception as e:
         err_msg = str(e) if str(e) else e.__class__.__name__
-        logging.error(f"发送任务异常: {err_msg}")
+        logging.error(f"发送任务异常退出: {err_msg}")
     finally:
         logging.info("发送任务已退出")
 
