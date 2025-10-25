@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import requests
 import json
 import time
@@ -9,8 +10,10 @@ from PIL import Image
 import asyncio
 import websockets
 
-# --- 绘画相关工具与队列（从 main.py 拆分） ---
+# --- 绘画相关工具与队列 ---
+# 【重要】心跳处理已分离到 ping.py 模块，此处仅处理绘画操作
 # 全局粘包队列（供 send_paint_data 与 paint 使用）
+# 注意：粘包队列仅用于绘画操作(0xfe)，不包含心跳包(0xfb/0xfc)
 paint_queue = []
 total_size = 0
 
@@ -35,8 +38,33 @@ def get_merged_data():
     return merged
 
 
+def restart_script(delay=0.5):
+    """同步重启当前 Python 进程。
+
+    在检测到无法恢复的连接关闭后调用此函数以替换当前进程，
+    从而实现“主动重启整个脚本”的需求。
+    """
+    try:
+        logging.info("检测到连接关闭异常，准备重启进程以恢复绘画...")
+    except Exception:
+        pass
+    try:
+        # 给出短暂延迟以便日志能刷新并让其他任务有机会清理
+        try:
+            time.sleep(delay)
+        except Exception:
+            pass
+        args = [sys.executable] + sys.argv
+        os.execv(sys.executable, args)
+    except Exception:
+        logging.exception("尝试重启进程失败")
+
+
 def filter_pong_from_data(data):
     """从粘包数据中过滤掉所有 Pong (0xfb) 包单元
+    
+    【已过时】此函数现在主要用于向后兼容。
+    在新的架构中，Pong 包由 ping.py 模块独立处理，永远不会进入粘包队列。
     
     这是为了避免在重连后发送旧的 Pong，导致 "unexpected pong" 协议错误。
     Pong 是对 Ping 的一次性响应，不应该被重新发送。
@@ -148,6 +176,12 @@ async def send_paint_data(ws, interval_ms):
                                 logging.debug("过滤后没有需要重新入队的数据")
                         except Exception as e2:
                             logging.debug(f"重新入队时出错: {e2}")
+                        # 在发生连接关闭且数据已妥善处理后，主动重启整个脚本以确保绘画任务能恢复
+                        try:
+                            restart_script()
+                        except Exception:
+                            # 如果重启失败，记录但不抛出（任务保持运行，等待上下文取消）
+                            logging.exception("尝试触发进程重启时出错")
                     except asyncio.TimeoutError:
                         # 发送超时，过滤掉 Pong 后重新入队
                         logging.debug(f"发送超时，数据已重新入队")

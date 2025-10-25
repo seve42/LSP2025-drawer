@@ -11,6 +11,7 @@ import sys
 from uuid import UUID
 from PIL import Image
 import tool
+import ping
 import threading
 from collections import OrderedDict, deque
 
@@ -560,11 +561,20 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             # 画板状态改变事件（用于唤醒调度器进行即时修复）
             state_changed_event = asyncio.Event()
 
+            # 创建心跳管理器
+            heartbeat_manager = ping.HeartbeatManager(ws, timeout=30.0)
+            
+            # 启动心跳监控任务（可选，用于定期输出心跳状态）
+            heartbeat_monitor_task = asyncio.create_task(
+                ping.monitor_heartbeat(heartbeat_manager, check_interval=30.0)
+            )
+            
             # 启动接收任务：处理 Ping(0xfc)、绘画结果(0xff)、画板更新(0xfa) 等
             async def receiver():
-                """接收并处理服务器消息，增强异常处理和心跳响应
+                """接收并处理服务器消息，使用独立的 ping.py 模块处理心跳
                 
                 改进：
+                - 使用专门的 HeartbeatManager 处理心跳
                 - 更完善的异常捕获和分类处理
                 - 连续错误计数和自动退出
                 - 详细的错误日志
@@ -586,19 +596,16 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                 opcode = data[offset]
                                 offset += 1
                                 if opcode == 0xfc:  # Heartbeat Ping
-                                    # 【根本修复】Pong 必须立即单独发送，不能通过粘包队列
-                                    # 文档示例明确显示：ws.send(new Uint8Array([0xfb]))
-                                    # 粘包机制仅用于绘画操作的优化，心跳必须实时响应
-                                    logging.debug("收到 Ping，立即发送 Pong。")
-                                    try:
-                                        await ws.send(bytes([0xfb]))
+                                    # 【关键修复】使用专门的心跳管理器处理 Ping
+                                    # 心跳管理器会立即发送 Pong，不经过粘包队列
+                                    success = await heartbeat_manager.handle_ping()
+                                    if success:
                                         consecutive_errors = 0  # 成功处理心跳后重置错误计数
-                                    except Exception as e:
-                                        err_msg = str(e) if str(e) else e.__class__.__name__
-                                        logging.warning(f"发送 Pong 时出错: {err_msg}")
+                                    else:
                                         consecutive_errors += 1
                                         if consecutive_errors >= max_consecutive_errors:
                                             logging.error("心跳处理连续失败，接收任务退出。")
+                                            logging.info(heartbeat_manager.get_summary())
                                             return
                                 elif opcode == 0xff:  # 绘画结果
                                     if offset + 5 > len(data):
@@ -681,20 +688,24 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     
                     # 正常退出循环（连接关闭）
                     logging.info(f"WebSocket 消息流结束（共接收 {message_count} 条消息），接收任务退出。")
+                    logging.info(f"[最终] {heartbeat_manager.get_summary()}")
                     
                 except (websockets.exceptions.ConnectionClosed,
                         websockets.exceptions.ConnectionClosedError,
                         websockets.exceptions.ConnectionClosedOK) as e:
                     err_msg = str(e) if str(e) else e.__class__.__name__
                     logging.info(f"WebSocket 连接已关闭: {err_msg} (接收了 {message_count} 条消息)")
+                    logging.info(f"[最终] {heartbeat_manager.get_summary()}")
                 except asyncio.CancelledError:
                     # 任务被取消时正常退出
                     logging.debug(f"接收任务被取消 (已接收 {message_count} 条消息)")
+                    logging.debug(f"[最终] {heartbeat_manager.get_summary()}")
                     raise
                 except Exception as e:
                     err_msg = str(e) if str(e) else e.__class__.__name__
                     err_type = e.__class__.__name__
                     logging.exception(f"WebSocket 接收处理时发生未预期异常 ({err_type}): {err_msg}")
+                    logging.info(f"[最终] {heartbeat_manager.get_summary()}")
                 finally:
                     logging.info("接收任务已退出。")
 
@@ -1222,6 +1233,9 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             if not receiver_task.done():
                 receiver_task.cancel()
                 tasks_to_cancel.append(receiver_task)
+            if not heartbeat_monitor_task.done():
+                heartbeat_monitor_task.cancel()
+                tasks_to_cancel.append(heartbeat_monitor_task)
 
             # 等待任务完全退出（最多等待1秒）
             if tasks_to_cancel:
