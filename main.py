@@ -513,8 +513,8 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         # 限制握手与关闭超时，避免卡住；部分环境下可减轻“opening handshake 超时”的长期滞留
         async with websockets.connect(
             WS_URL,
-            # ping_interval=20,      # 每20秒发送一次 ping（服务器要求30秒内响应）
-            # ping_timeout=25,       # 25秒超时（留出余量，避免 Ping timeout）
+            ping_interval=20,      # 每20秒发送一次 ping（服务器要求30秒内响应）
+            ping_timeout=25,       # 25秒超时（留出余量，避免 Ping timeout）
             open_timeout=30,       # 增加握手超时到30秒
             close_timeout=10,
             max_size=10 * 1024 * 1024,  # 10MB 消息大小限制
