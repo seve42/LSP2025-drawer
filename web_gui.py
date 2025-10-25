@@ -9,6 +9,7 @@ import time
 from flask import Flask, render_template, jsonify, request, send_from_directory, session, redirect, url_for
 from flask_socketio import SocketIO, emit
 from PIL import Image
+from werkzeug.utils import secure_filename
 import base64
 import io
 import logging
@@ -141,6 +142,13 @@ def get_status():
                 'overlay': gui_state.get('overlay', False),
                 'assigned_per_image': dict(gui_state.get('assigned_per_image', {}))
             }
+            # 增加后端运行状态信息（由 main.py 维护）
+            try:
+                status['backend_status'] = gui_state.get('backend_status', 'unknown')
+                status['backend_exception'] = gui_state.get('backend_exception', '')
+            except Exception:
+                status['backend_status'] = 'unknown'
+                status['backend_exception'] = ''
         return jsonify(status)
     except Exception as e:
         logging.error(f"获取状态失败: {e}")
@@ -485,6 +493,282 @@ def update_image_position(index):
         return jsonify({'success': True})
     except Exception as e:
         logging.error(f"更新图片位置失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ============= 用户管理 API =============
+
+@app.route('/api/users')
+def get_users():
+    """获取用户列表"""
+    if config is None:
+        return jsonify({'error': 'Config not initialized'}), 500
+    
+    try:
+        users = config.get('users', [])
+        users_list = []
+        for idx, user in enumerate(users):
+            users_list.append({
+                'index': idx,
+                'uid': user.get('uid'),
+                'access_key': user.get('access_key', ''),
+                'has_token': user.get('uid') in [u['uid'] for u in users_with_tokens] if users_with_tokens else False
+            })
+        return jsonify({'users': users_list})
+    except Exception as e:
+        logging.error(f"获取用户列表失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/users/add', methods=['POST'])
+def add_user():
+    """添加用户（UID + access_key）并自动获取token"""
+    data = request.get_json()
+    
+    if config is None:
+        return jsonify({'error': 'Config not initialized'}), 400
+    
+    try:
+        uid = int(data.get('uid'))
+        access_key = data.get('access_key', '').strip()
+        
+        if not uid or not access_key:
+            return jsonify({'error': '请提供 UID 和 access_key'}), 400
+        
+        # 检查是否已存在
+        users = config.get('users', [])
+        for u in users:
+            if u.get('uid') == uid:
+                return jsonify({'error': f'UID {uid} 已存在'}), 400
+        
+        # 添加到配置
+        new_user = {'uid': uid, 'access_key': access_key}
+        users.append(new_user)
+        config['users'] = users
+        save_config_to_file(config)
+        
+        # 在后台线程获取token并加入绘制队列
+        def fetch_token_and_add():
+            try:
+                import main as main_module
+                token = main_module.get_token(uid, access_key)
+                if token and users_with_tokens is not None:
+                    users_with_tokens.append({'uid': uid, 'token': token})
+                    log_to_web(f"成功为 UID {uid} 获取 token 并加入绘制队列")
+                else:
+                    log_to_web(f"无法为 UID {uid} 获取 token，请检查 access_key")
+            except Exception as e:
+                log_to_web(f"获取 token 失败: {e}")
+        
+        threading.Thread(target=fetch_token_and_add, daemon=True).start()
+        
+        return jsonify({'success': True, 'message': '用户已添加，正在获取 token...'})
+    except Exception as e:
+        logging.error(f"添加用户失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/users/delete', methods=['POST'])
+def delete_user():
+    """删除用户（从配置和运行时列表中移除）"""
+    data = request.get_json()
+    
+    if config is None:
+        return jsonify({'error': 'Config not initialized'}), 400
+    
+    try:
+        index = data.get('index')
+        if index is None:
+            uid = data.get('uid')
+            if uid is None:
+                return jsonify({'error': '请提供 index 或 uid'}), 400
+            # 根据 UID 查找索引
+            users = config.get('users', [])
+            index = None
+            for idx, u in enumerate(users):
+                if u.get('uid') == uid:
+                    index = idx
+                    break
+            if index is None:
+                return jsonify({'error': f'未找到 UID {uid}'}), 404
+        
+        users = config.get('users', [])
+        if index < 0 or index >= len(users):
+            return jsonify({'error': 'Invalid index'}), 400
+        
+        removed_user = users.pop(index)
+        removed_uid = removed_user.get('uid')
+        config['users'] = users
+        save_config_to_file(config)
+        
+        # 从运行时 token 列表中移除
+        if users_with_tokens is not None:
+            users_with_tokens[:] = [u for u in users_with_tokens if u['uid'] != removed_uid]
+        
+        log_to_web(f"已删除用户 UID {removed_uid}")
+        return jsonify({'success': True, 'message': f'已删除用户 UID {removed_uid}'})
+    except Exception as e:
+        logging.error(f"删除用户失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ============= 图片上传 API =============
+
+@app.route('/api/images/upload', methods=['POST'])
+def upload_image():
+    """上传图片文件"""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'error': '没有上传文件'}), 400
+        
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({'error': '文件名为空'}), 400
+        
+        # 确保 smallimage 目录存在
+        upload_dir = 'smallimage'
+        if not os.path.exists(upload_dir):
+            os.makedirs(upload_dir)
+        
+        # 生成安全的文件名
+        from werkzeug.utils import secure_filename
+        filename = secure_filename(file.filename)
+        
+        # 如果文件已存在，添加时间戳
+        if os.path.exists(os.path.join(upload_dir, filename)):
+            name, ext = os.path.splitext(filename)
+            filename = f"{name}_{int(time.time())}{ext}"
+        
+        filepath = os.path.join(upload_dir, filename)
+        file.save(filepath)
+        
+        # 验证是否为有效图片
+        try:
+            from PIL import Image
+            img = Image.open(filepath)
+            width, height = img.size
+            img.close()
+        except Exception as e:
+            os.remove(filepath)
+            return jsonify({'error': f'无效的图片文件: {e}'}), 400
+        
+        log_to_web(f"成功上传图片: {filename} ({width}x{height})")
+        
+        return jsonify({
+            'success': True,
+            'filename': filename,
+            'filepath': filepath,
+            'width': width,
+            'height': height
+        })
+    except Exception as e:
+        logging.error(f"上传图片失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/images/add', methods=['POST'])
+def add_image():
+    """添加图片到配置（上传后或选择已有文件）"""
+    data = request.get_json()
+    
+    if config is None:
+        return jsonify({'error': 'Config not initialized'}), 400
+    
+    try:
+        image_path = data.get('image_path', '').strip()
+        if not image_path:
+            return jsonify({'error': '请提供图片路径'}), 400
+        
+        # 验证文件存在
+        if not os.path.exists(image_path):
+            return jsonify({'error': f'文件不存在: {image_path}'}), 404
+        
+        # 获取图片尺寸
+        try:
+            from PIL import Image
+            img = Image.open(image_path)
+            width, height = img.size
+            img.close()
+        except Exception as e:
+            return jsonify({'error': f'无法读取图片: {e}'}), 400
+        
+        # 添加到配置
+        new_image = {
+            'image_path': image_path,
+            'start_x': int(data.get('start_x', 0)),
+            'start_y': int(data.get('start_y', 0)),
+            'draw_mode': data.get('draw_mode', 'random'),
+            'weight': float(data.get('weight', 1.0)),
+            'enabled': bool(data.get('enabled', True)),
+            'width': width,
+            'height': height
+        }
+        
+        config.setdefault('images', []).append(new_image)
+        save_config_to_file(config)
+        
+        if REFRESH_CALLBACK:
+            try:
+                REFRESH_CALLBACK(config)
+            except Exception:
+                pass
+        
+        log_to_web(f"已添加图片: {image_path}")
+        return jsonify({'success': True, 'message': f'已添加图片: {os.path.basename(image_path)}'})
+    except Exception as e:
+        logging.error(f"添加图片失败: {e}")
+        return jsonify({'error': str(e)}), 500
+
+# ============= 攻击配置 API =============
+
+@app.route('/api/attack/add', methods=['POST'])
+def add_attack():
+    """添加攻击配置"""
+    data = request.get_json()
+    
+    if config is None:
+        return jsonify({'error': 'Config not initialized'}), 400
+    
+    try:
+        attack_kind = data.get('attack_kind', 'white')
+        width = int(data.get('width', 100))
+        height = int(data.get('height', 100))
+        dot_count = data.get('dot_count')
+        
+        if width <= 0 or height <= 0:
+            return jsonify({'error': '宽度和高度必须大于0'}), 400
+        
+        if width > 1000 or height > 600:
+            return jsonify({'error': '宽度不能超过1000，高度不能超过600'}), 400
+        
+        # 创建攻击配置
+        attack_config = {
+            'type': 'attack',
+            'attack_kind': attack_kind,
+            'width': width,
+            'height': height,
+            'start_x': int(data.get('start_x', 0)),
+            'start_y': int(data.get('start_y', 0)),
+            'draw_mode': data.get('draw_mode', 'random'),
+            'weight': float(data.get('weight', 1.0)),
+            'enabled': bool(data.get('enabled', True))
+        }
+        
+        if dot_count is not None:
+            try:
+                attack_config['dot_count'] = int(dot_count)
+            except:
+                pass
+        
+        config.setdefault('images', []).append(attack_config)
+        save_config_to_file(config)
+        
+        if REFRESH_CALLBACK:
+            try:
+                REFRESH_CALLBACK(config)
+            except Exception:
+                pass
+        
+        kind_cn = {'white': '白点', 'green': '亮绿色点', 'random': '随机色点'}.get(attack_kind, attack_kind)
+        log_to_web(f"已添加攻击: {kind_cn} {width}x{height}")
+        return jsonify({'success': True, 'message': f'已添加攻击: {kind_cn}'})
+    except Exception as e:
+        logging.error(f"添加攻击失败: {e}")
         return jsonify({'error': str(e)}), 500
 
 # WebSocket 事件处理

@@ -347,6 +347,10 @@
             <div class="info-text">
                 连接状态: <span class="connection-status status-connecting" id="conn-status">连接中...</span>
             </div>
+            <div class="info-text">
+                后端状态: <span class="connection-status" id="backend-status">未知</span>
+                <button id="restart-backend" class="btn-danger" style="margin-left:10px;">🔁 重启后端</button>
+            </div>
         </div>
         
         <!-- 图片管理 -->
@@ -373,6 +377,35 @@
             </table>
             <div class="controls">
                 <button id="refresh-images">🔄 刷新图片</button>
+                <button id="add-image-btn" class="btn-secondary">➕ 上传图片</button>
+                <button id="add-attack-btn" class="btn-secondary">⚔️ 添加攻击</button>
+            </div>
+        </div>
+        
+        <!-- 用户管理 -->
+        <div class="section">
+            <div class="section-title">用户管理</div>
+            <table id="users-table">
+                <thead>
+                    <tr>
+                        <th>UID</th>
+                        <th>Access Key</th>
+                        <th>Token状态</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="users-tbody">
+                    <tr><td colspan="4">加载中...</td></tr>
+                </tbody>
+            </table>
+            <div id="users-pagination" style="margin-top:8px; display:flex; gap:8px; align-items:center;">
+                <button id="users-prev" class="btn-secondary">上一页</button>
+                <span>第 <span id="users-page">1</span> 页 / 共 <span id="users-total-pages">1</span> 页</span>
+                <button id="users-next" class="btn-secondary">下一页</button>
+            </div>
+            <div class="controls">
+                <button id="refresh-users">🔄 刷新用户</button>
+                <button id="add-user-btn" class="btn-secondary">➕ 添加用户</button>
             </div>
         </div>
     </div>
@@ -439,6 +472,121 @@
         </div>
     </div>
     
+    <!-- 添加用户模态框 -->
+    <div id="add-user-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">添加用户</div>
+            <div class="form-group">
+                <label>UID:</label>
+                <input type="number" id="add-user-uid" placeholder="输入用户UID">
+            </div>
+            <div class="form-group">
+                <label>Access Key:</label>
+                <input type="text" id="add-user-key" placeholder="输入Access Key">
+            </div>
+            <div class="controls">
+                <button id="save-add-user">保存</button>
+                <button id="cancel-add-user" class="btn-secondary">取消</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 上传图片模态框 -->
+    <div id="upload-image-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">上传图片</div>
+            <div class="form-group">
+                <label>选择图片文件:</label>
+                <input type="file" id="upload-image-file" accept="image/*">
+            </div>
+            <div class="form-group">
+                <label>起点 X:</label>
+                <input type="number" id="upload-image-x" value="0" min="0" max="999">
+            </div>
+            <div class="form-group">
+                <label>起点 Y:</label>
+                <input type="number" id="upload-image-y" value="0" min="0" max="599">
+            </div>
+            <div class="form-group">
+                <label>绘图模式:</label>
+                <select id="upload-image-mode">
+                    <option value="random">random</option>
+                    <option value="horizontal">horizontal</option>
+                    <option value="concentric">concentric</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>权重:</label>
+                <input type="number" id="upload-image-weight" value="1.0" min="0.1" max="10" step="0.1">
+            </div>
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" id="upload-image-enabled" checked> 启用
+                </label>
+            </div>
+            <div class="controls">
+                <button id="save-upload-image">上传并添加</button>
+                <button id="cancel-upload-image" class="btn-secondary">取消</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- 添加攻击模态框 -->
+    <div id="add-attack-modal" class="modal">
+        <div class="modal-content">
+            <div class="modal-header">添加攻击</div>
+            <div class="form-group">
+                <label>攻击类型:</label>
+                <select id="attack-kind">
+                    <option value="white">白点</option>
+                    <option value="green">亮绿色点</option>
+                    <option value="random">随机色点</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>宽度:</label>
+                <input type="number" id="attack-width" value="100" min="1" max="1000">
+            </div>
+            <div class="form-group">
+                <label>高度:</label>
+                <input type="number" id="attack-height" value="100" min="1" max="600">
+            </div>
+            <div class="form-group">
+                <label>点数量 (可选，默认为面积的2%):</label>
+                <input type="number" id="attack-dot-count" placeholder="留空使用默认值" min="1">
+            </div>
+            <div class="form-group">
+                <label>起点 X:</label>
+                <input type="number" id="attack-x" value="0" min="0" max="999">
+            </div>
+            <div class="form-group">
+                <label>起点 Y:</label>
+                <input type="number" id="attack-y" value="0" min="0" max="599">
+            </div>
+            <div class="form-group">
+                <label>绘图模式:</label>
+                <select id="attack-mode">
+                    <option value="random">random</option>
+                    <option value="horizontal">horizontal</option>
+                    <option value="concentric">concentric</option>
+                </select>
+            </div>
+            <div class="form-group">
+                <label>权重:</label>
+                <input type="number" id="attack-weight" value="1.0" min="0.1" max="10" step="0.1">
+            </div>
+            <div class="form-group">
+                <label>
+                    <input type="checkbox" id="attack-enabled" checked> 启用
+                </label>
+            </div>
+            <div class="controls">
+                <button id="save-add-attack">添加攻击</button>
+                <button id="cancel-add-attack" class="btn-secondary">取消</button>
+            </div>
+        </div>
+    </div>
+    
     <script>
         // WebSocket 连接
         const socket = io();
@@ -452,6 +600,9 @@
         let dragStartY = 0;
     let overlayEnabled = false;
         let editingIndex = null;
+        // 用户列表分页
+        let usersPage = 1;
+        const usersPageSize = 10;
 
         // 拖动设置起点相关（使用缓存避免频繁 fetch）
         let dragPositionIndex = null;
@@ -644,6 +795,26 @@
                     } else if (data.conn_status === 'connecting') { connStatus.textContent = '连接中...'; connStatus.className = 'connection-status status-connecting'; }
                     else { connStatus.textContent = `断开 [${data.conn_reason || '未知原因'}]`; connStatus.className = 'connection-status status-disconnected'; }
                     if (data.server_offline) connStatus.textContent += '（服务器离线）';
+
+                    // 后端运行状态显示
+                    try {
+                        const backendEl = document.getElementById('backend-status');
+                        const bs = data.backend_status || 'unknown';
+                        if (bs === 'online') {
+                            backendEl.textContent = '在线';
+                            backendEl.className = 'connection-status status-connected';
+                        } else if (bs === 'restarting') {
+                            backendEl.textContent = '重启中';
+                            backendEl.className = 'connection-status status-connecting';
+                        } else if (bs === 'exception') {
+                            let msg = data.backend_exception || '';
+                            backendEl.textContent = '异常' + (msg ? (': ' + msg.split('\n')[0]) : '');
+                            backendEl.className = 'connection-status status-disconnected';
+                        } else {
+                            backendEl.textContent = String(bs);
+                            backendEl.className = 'connection-status';
+                        }
+                    } catch (e) { console.error('更新后端状态失败', e); }
                 })
                 .catch(err => console.error('更新状态失败:', err));
         }
@@ -709,6 +880,237 @@
         function deleteImage(index) { if (!confirm('确定要删除这个图片吗?')) return; fetch('/api/images/delete', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ index: index }) }).then(res => res.json()).then(() => { loadImages(); scheduleRedraw(); }).catch(err => console.error('删除图片失败:', err)); }
 
         document.getElementById('refresh-images').addEventListener('click', () => { loadImages(); scheduleRedraw(); });
+
+        // ============= 用户管理功能 =============
+        
+        function loadUsers() {
+            fetch('/api/users')
+                .then(res => res.json())
+                .then(data => {
+                    const tbody = document.getElementById('users-tbody');
+                    tbody.innerHTML = '';
+                    const users = data.users || [];
+                    const total = users.length;
+                    const totalPages = Math.max(1, Math.ceil(total / usersPageSize));
+                    if (usersPage > totalPages) usersPage = totalPages;
+                    const start = (usersPage - 1) * usersPageSize;
+                    const end = Math.min(total, start + usersPageSize);
+                    for (let i = start; i < end; i++) {
+                        const user = users[i];
+                        const row = document.createElement('tr');
+                        row.innerHTML = `
+                            <td>${user.uid}</td>
+                            <td>${(user.access_key || '').substring(0, 4)}****</td>
+                            <td>${user.has_token ? '<span class="enabled-check">✓ 有效</span>' : '<span class="disabled-cross">✗ 无效</span>'}</td>
+                            <td>
+                                <button onclick="deleteUser(${user.index})" class="btn-danger">删除</button>
+                            </td>
+                        `;
+                        tbody.appendChild(row);
+                    }
+                    document.getElementById('users-page').textContent = usersPage;
+                    document.getElementById('users-total-pages').textContent = totalPages;
+                })
+                .catch(err => console.error('加载用户列表失败:', err));
+        }
+
+        // 分页控制
+        document.getElementById('users-prev').addEventListener('click', () => {
+            if (usersPage > 1) { usersPage--; loadUsers(); }
+        });
+        document.getElementById('users-next').addEventListener('click', () => {
+            usersPage++; loadUsers();
+        });
+
+        function deleteUser(index) {
+            if (!confirm('确定要删除这个用户吗？用户将立即从绘制队列中移除。')) return;
+            fetch('/api/users/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ index: index })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        alert(data.message || '删除成功');
+                        loadUsers();
+                    } else {
+                        alert('删除失败: ' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(err => {
+                    console.error('删除用户失败:', err);
+                    alert('删除失败: ' + err.message);
+                });
+        }
+
+        document.getElementById('refresh-users').addEventListener('click', loadUsers);
+        
+        document.getElementById('add-user-btn').addEventListener('click', () => {
+            document.getElementById('add-user-modal').style.display = 'block';
+            document.getElementById('add-user-uid').value = '';
+            document.getElementById('add-user-key').value = '';
+        });
+
+        document.getElementById('save-add-user').addEventListener('click', () => {
+            const uid = document.getElementById('add-user-uid').value;
+            const key = document.getElementById('add-user-key').value;
+            
+            if (!uid || !key) {
+                alert('请填写所有字段');
+                return;
+            }
+            
+            fetch('/api/users/add', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ uid: parseInt(uid), access_key: key })
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        alert(data.message || '添加成功');
+                        document.getElementById('add-user-modal').style.display = 'none';
+                        loadUsers();
+                    } else {
+                        alert('添加失败: ' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(err => {
+                    console.error('添加用户失败:', err);
+                    alert('添加失败: ' + err.message);
+                });
+        });
+
+        document.getElementById('cancel-add-user').addEventListener('click', () => {
+            document.getElementById('add-user-modal').style.display = 'none';
+        });
+
+        // 后端重启按钮
+        document.getElementById('restart-backend').addEventListener('click', () => {
+            if (!confirm('确定要重启后端吗？这会停止当前后台并尝试重启。')) return;
+            fetch('/api/restart', { method: 'POST' })
+                .then(res => res.json())
+                .then(data => { alert(data.message || '正在重启后端'); })
+                .catch(err => { console.error('重启请求失败:', err); alert('重启请求失败: ' + err.message); });
+        });
+
+        // ============= 图片上传功能 =============
+        
+        document.getElementById('add-image-btn').addEventListener('click', () => {
+            document.getElementById('upload-image-modal').style.display = 'block';
+            document.getElementById('upload-image-file').value = '';
+        });
+
+        document.getElementById('save-upload-image').addEventListener('click', async () => {
+            const fileInput = document.getElementById('upload-image-file');
+            if (!fileInput.files || fileInput.files.length === 0) {
+                alert('请选择图片文件');
+                return;
+            }
+            
+            const file = fileInput.files[0];
+            const formData = new FormData();
+            formData.append('file', file);
+            
+            try {
+                // 先上传文件
+                const uploadRes = await fetch('/api/images/upload', {
+                    method: 'POST',
+                    body: formData
+                });
+                const uploadData = await uploadRes.json();
+                
+                if (!uploadData.success) {
+                    alert('上传失败: ' + (uploadData.error || '未知错误'));
+                    return;
+                }
+                
+                // 然后添加到配置
+                const addData = {
+                    image_path: uploadData.filepath,
+                    start_x: parseInt(document.getElementById('upload-image-x').value),
+                    start_y: parseInt(document.getElementById('upload-image-y').value),
+                    draw_mode: document.getElementById('upload-image-mode').value,
+                    weight: parseFloat(document.getElementById('upload-image-weight').value),
+                    enabled: document.getElementById('upload-image-enabled').checked
+                };
+                
+                const addRes = await fetch('/api/images/add', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(addData)
+                });
+                const addResData = await addRes.json();
+                
+                if (addResData.success) {
+                    alert(addResData.message || '添加成功');
+                    document.getElementById('upload-image-modal').style.display = 'none';
+                    loadImages();
+                    scheduleRedraw();
+                } else {
+                    alert('添加失败: ' + (addResData.error || '未知错误'));
+                }
+            } catch (err) {
+                console.error('上传图片失败:', err);
+                alert('操作失败: ' + err.message);
+            }
+        });
+
+        document.getElementById('cancel-upload-image').addEventListener('click', () => {
+            document.getElementById('upload-image-modal').style.display = 'none';
+        });
+
+        // ============= 攻击功能 =============
+        
+        document.getElementById('add-attack-btn').addEventListener('click', () => {
+            document.getElementById('add-attack-modal').style.display = 'block';
+        });
+
+        document.getElementById('save-add-attack').addEventListener('click', () => {
+            const attackData = {
+                attack_kind: document.getElementById('attack-kind').value,
+                width: parseInt(document.getElementById('attack-width').value),
+                height: parseInt(document.getElementById('attack-height').value),
+                start_x: parseInt(document.getElementById('attack-x').value),
+                start_y: parseInt(document.getElementById('attack-y').value),
+                draw_mode: document.getElementById('attack-mode').value,
+                weight: parseFloat(document.getElementById('attack-weight').value),
+                enabled: document.getElementById('attack-enabled').checked
+            };
+            
+            const dotCount = document.getElementById('attack-dot-count').value;
+            if (dotCount) {
+                attackData.dot_count = parseInt(dotCount);
+            }
+            
+            fetch('/api/attack/add', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(attackData)
+            })
+                .then(res => res.json())
+                .then(data => {
+                    if (data.success) {
+                        alert(data.message || '添加成功');
+                        document.getElementById('add-attack-modal').style.display = 'none';
+                        loadImages();
+                        scheduleRedraw();
+                    } else {
+                        alert('添加失败: ' + (data.error || '未知错误'));
+                    }
+                })
+                .catch(err => {
+                    console.error('添加攻击失败:', err);
+                    alert('操作失败: ' + err.message);
+                });
+        });
+
+        document.getElementById('cancel-add-attack').addEventListener('click', () => {
+            document.getElementById('add-attack-modal').style.display = 'none';
+        });
+
+        // ============= 拖动设置起点功能 =============
 
         // 拖动设置起点功能：打开时缓存底图和目标图，mousemove 只做本地绘制
         document.getElementById('drag-set-position').addEventListener('click', () => {
@@ -788,10 +1190,11 @@
         socket.on('status_update', data => {});
 
         // 初始化并启动定时任务
-        initCanvas(); loadImages(); updateStatus();
+        initCanvas(); loadImages(); updateStatus(); loadUsers();
         setInterval(updateStatus, 1000);
         setInterval(scheduleRedraw, 4000); // 每4秒调度一次重绘（实际有缓存避免重复解码）
         setInterval(loadImages, 5000);
+        setInterval(loadUsers, 10000); // 每10秒刷新用户列表
     </script>
 </body>
 </html>

@@ -513,13 +513,13 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         # 限制握手与关闭超时，避免卡住；部分环境下可减轻“opening handshake 超时”的长期滞留
         async with websockets.connect(
             WS_URL,
-            ping_interval=10,      # 每10秒发送一次 ping（更频繁，快速检测连接问题）
-            ping_timeout=30,       # 30秒超时（缩短超时时间，更快检测失败）
-            open_timeout=20,       # 增加握手超时到20秒
+            # ping_interval=20,      # 每20秒发送一次 ping（服务器要求30秒内响应）
+            # ping_timeout=25,       # 25秒超时（留出余量，避免 Ping timeout）
+            open_timeout=30,       # 增加握手超时到30秒
             close_timeout=10,
             max_size=10 * 1024 * 1024,  # 10MB 消息大小限制
         ) as ws:
-            logging.info("WebSocket 连接已建立（心跳优化: ping间隔=10s, 超时=30s）")
+            logging.info("WebSocket 连接已建立（心跳优化: ping间隔=20s, 超时=25s）")
             # 更新 GUI 状态：已连接
             try:
                 if gui_state is not None:
@@ -594,8 +594,12 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                             websockets.exceptions.ConnectionClosedError,
                                             websockets.exceptions.ConnectionClosedOK) as e:
                                         err_msg = str(e) if str(e) else e.__class__.__name__
-                                        logging.warning(f"响应 Pong 时连接已关闭: {err_msg}，接收任务退出。")
-                                        return
+                                        logging.info(f"响应 Pong 时连接已关闭: {err_msg}，等待重连。")
+                                        # 不要立即退出，让健康检查来处理
+                                        consecutive_errors += 1
+                                        if consecutive_errors >= max_consecutive_errors:
+                                            logging.warning("心跳响应连续失败次数过多，接收任务退出。")
+                                            return
                                     except Exception as e:
                                         err_msg = str(e) if str(e) else e.__class__.__name__
                                         logging.warning(f"响应 Pong 失败: {err_msg}")
@@ -896,9 +900,11 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
 
             # 健康检查：定期验证连接和任务状态
             last_health_check = time.monotonic()
-            health_check_interval = 5  # 缩短到每5秒进行一次完整健康检查，更快检测连接问题
+            health_check_interval = 10  # 每10秒进行一次完整健康检查
             last_task_check = time.monotonic()
             task_check_interval = 2  # 每2秒快速检查任务状态
+            connection_warnings = 0  # 连续警告次数
+            max_connection_warnings = 3  # 允许3次连续警告再退出
             
             while True:
                 now = time.monotonic()
@@ -915,11 +921,11 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                 exc = sender_task.exception() if not sender_task.cancelled() else None
                                 if exc:
                                     logging.error(f"发送任务异常退出: {exc}")
+                                    connection_issue = True
                                 else:
-                                    logging.warning("发送任务已正常退出，可能由于连接问题")
+                                    logging.debug("发送任务已退出（无异常）")
                             except Exception as e:
-                                logging.warning(f"发送任务已退出: {e}")
-                            connection_issue = True
+                                logging.debug(f"发送任务已退出: {e}")
                     except Exception as e:
                         logging.debug(f"检查发送任务状态时出错: {e}")
                     
@@ -930,11 +936,11 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                 exc = receiver_task.exception() if not receiver_task.cancelled() else None
                                 if exc:
                                     logging.error(f"接收任务异常退出: {exc}")
+                                    connection_issue = True
                                 else:
-                                    logging.warning("接收任务已正常退出，可能由于连接问题")
+                                    logging.debug("接收任务已退出（无异常）")
                             except Exception as e:
-                                logging.warning(f"接收任务已退出: {e}")
-                            connection_issue = True
+                                logging.debug(f"接收任务已退出: {e}")
                     except Exception as e:
                         logging.debug(f"检查接收任务状态时出错: {e}")
                     
@@ -944,15 +950,23 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         if is_open is None:
                             is_open = not getattr(ws, "closed", False)
                         if not is_open:
-                            logging.warning("检测到 WebSocket 已关闭")
-                            connection_issue = True
+                            connection_warnings += 1
+                            if connection_warnings >= max_connection_warnings:
+                                logging.warning(f"检测到 WebSocket 已关闭（连续{connection_warnings}次）")
+                                connection_issue = True
+                            else:
+                                logging.debug(f"连接暂时断开（警告 {connection_warnings}/{max_connection_warnings}）")
+                        else:
+                            # 连接恢复，重置警告计数
+                            if connection_warnings > 0:
+                                logging.info(f"连接已恢复，重置警告计数（之前: {connection_warnings}）")
+                                connection_warnings = 0
                     except Exception as e:
                         logging.debug(f"检查连接状态时出错: {e}")
-                        connection_issue = True
                     
-                    # 如果检测到连接问题，立即清理并退出
+                    # 如果检测到严重连接问题，立即清理并退出
                     if connection_issue:
-                        logging.warning("检测到连接异常，退出当前循环以便重连。")
+                        logging.warning("检测到严重连接异常，退出当前循环以便重连。")
                         try:
                             # 只取消未完成的任务，避免对已完成任务调用 cancel()
                             tasks_to_cancel = []
@@ -976,6 +990,7 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                             logging.debug("等待任务取消超时")
                         except Exception as e:
                             logging.debug(f"取消任务时出错: {e}")
+                        logging.info("任务已取消，即将退出 WebSocket 上下文并返回 run_forever 进行重连")
                         break
                 
                 # 完整健康检查（每10秒）- 包含详细日志
@@ -991,59 +1006,47 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         is_open = False
                     
                     if not is_open:
-                        logging.warning("健康检查：检测到 WebSocket 已关闭，退出以便重连。")
-                        try:
-                            # 只取消未完成的任务
-                            tasks_to_cancel = []
-                            if not progress_task.done():
-                                progress_task.cancel()
-                                tasks_to_cancel.append(progress_task)
-                            if not sender_task.done():
-                                sender_task.cancel()
-                                tasks_to_cancel.append(sender_task)
-                            if not receiver_task.done():
-                                receiver_task.cancel()
-                                tasks_to_cancel.append(receiver_task)
-                            
-                            if tasks_to_cancel:
-                                await asyncio.wait_for(
-                                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
-                                    timeout=2.0
-                                )
-                        except:
-                            pass
-                        break
+                        connection_warnings += 1
+                        if connection_warnings >= max_connection_warnings:
+                            logging.warning(f"健康检查：检测到 WebSocket 已关闭（连续{connection_warnings}次），退出以便重连。")
+                            try:
+                                # 只取消未完成的任务
+                                tasks_to_cancel = []
+                                if not progress_task.done():
+                                    progress_task.cancel()
+                                    tasks_to_cancel.append(progress_task)
+                                if not sender_task.done():
+                                    sender_task.cancel()
+                                    tasks_to_cancel.append(sender_task)
+                                if not receiver_task.done():
+                                    receiver_task.cancel()
+                                    tasks_to_cancel.append(receiver_task)
+                                
+                                if tasks_to_cancel:
+                                    await asyncio.wait_for(
+                                        asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                                        timeout=2.0
+                                    )
+                            except:
+                                pass
+                            break
+                        else:
+                            logging.debug(f"连接暂时断开（警告 {connection_warnings}/{max_connection_warnings}）")
+                    else:
+                        # 连接正常，重置警告计数
+                        if connection_warnings > 0:
+                            logging.info(f"连接已恢复，重置警告计数（之前: {connection_warnings}）")
+                            connection_warnings = 0
                     
-                    # 检查任务健康状态
+                    # 检查任务健康状态（仅记录，不退出）
                     sender_ok = not sender_task.done()
                     receiver_ok = not receiver_task.done()
                     progress_ok = not progress_task.done()
                     
                     if not sender_ok or not receiver_ok or not progress_ok:
-                        logging.warning(f"健康检查：任务状态异常 [发送:{sender_ok} 接收:{receiver_ok} 进度:{progress_ok}]，退出以便重连。")
-                        try:
-                            # 只取消未完成的任务
-                            tasks_to_cancel = []
-                            if not progress_task.done():
-                                progress_task.cancel()
-                                tasks_to_cancel.append(progress_task)
-                            if not sender_task.done():
-                                sender_task.cancel()
-                                tasks_to_cancel.append(sender_task)
-                            if not receiver_task.done():
-                                receiver_task.cancel()
-                                tasks_to_cancel.append(receiver_task)
-                            
-                            if tasks_to_cancel:
-                                await asyncio.wait_for(
-                                    asyncio.gather(*tasks_to_cancel, return_exceptions=True),
-                                    timeout=2.0
-                                )
-                        except:
-                            pass
-                        break
-                    
-                    logging.debug(f"健康检查通过：连接正常，所有任务运行中")
+                        logging.debug(f"健康检查：任务状态 [发送:{sender_ok} 接收:{receiver_ok} 进度:{progress_ok}]")
+                    else:
+                        logging.debug(f"健康检查通过：连接正常，所有任务运行中")
                 # 优先处理 GUI 请求的配置刷新（如图片路径、起点或模式被修改并调用 refresh_config）
                 if gui_state is not None and gui_state.get('reload_pixels'):
                     try:
@@ -1212,11 +1215,10 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                 # 有分配则短暂让出控制权（粘包发送会在后台周期触发）
                 await asyncio.sleep(0.1)
 
-            # 不再退出，理论上保持在 while True；若意外跳出则继续走到发送清空
-            logging.info("调度循环结束（意外），等待剩余数据发送...")
+            # 调度循环因检测到连接问题而退出，直接返回以便 run_forever 重连
+            logging.info("调度循环退出，准备重连...")
 
             # 确保所有后台任务都被取消（如果还没被取消）
-            # 只取消未完成的任务，避免对已完成任务调用 cancel()
             tasks_to_cancel = []
             if not progress_task.done():
                 progress_task.cancel()
@@ -1236,16 +1238,13 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         timeout=1.0
                     )
                 except asyncio.TimeoutError:
-                    logging.warning("等待后台任务退出超时，但继续清理")
+                    logging.debug("等待后台任务退出超时")
                 except Exception:
                     pass
 
-            # 等待发送队列清空
-            # paint_queue 已经被移到 tool.paint_queue 实现为模块全局
-            while getattr(tool, 'paint_queue', []) and not getattr(ws, "closed", False):
-                await asyncio.sleep(0.5)
-
-            logging.info("所有数据已发送/处理，准备关闭连接。")
+            # 不等待队列清空，直接返回让 run_forever 重连
+            # 队列中的数据会在下次连接时重新发送
+            logging.info("后台任务已清理，准备关闭连接。")
     finally:
         # 恢复之前的环境变量（如果有）
         if _saved_env:
@@ -1395,7 +1394,7 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
                 stability_score = min(100, (duration / 300.0) * 100) if duration > 0 else 0
                 logging.info(f'本次连接稳定性评分: {stability_score:.1f}/100')
             
-            logging.warning(f'主循环意外结束（运行时长: {last_successful_duration:.1f}s，原因: {exit_reason}），将在短暂等待后尝试重连。')
+            logging.warning(f'主循环结束（运行时长: {last_successful_duration:.1f}s，原因: {exit_reason}），将在 {backoff:.1f}s 后尝试重连。')
             
         except (websockets.exceptions.ConnectionClosedError,
                 websockets.exceptions.ConnectionClosedOK,
@@ -1662,6 +1661,9 @@ def main(args):
                 'overlay': False,
                 'images_data': images_data,
                 'log_to_web': lambda msg: None, # 初始为空函数
+                # 后端运行状态：online / restarting / exception
+                'backend_status': 'online',
+                'backend_exception': ''
             }
 
             # 定义重启函数
@@ -1670,6 +1672,11 @@ def main(args):
                 # 标记停止，以便正常关闭现有线程
                 with gui_state['lock']:
                     gui_state['stop'] = True
+                    # 标记后端正在重启（供前端显示）
+                    try:
+                        gui_state['backend_status'] = 'restarting'
+                    except Exception:
+                        pass
                 # 等待一小段时间让线程退出
                 time.sleep(2)
                 # 使用 os.execv 重启进程
@@ -1706,6 +1713,11 @@ def main(args):
             if 'gui_state' in locals():
                 with gui_state['lock']:
                     gui_state['stop'] = True
+                    try:
+                        gui_state['backend_status'] = 'exception'
+                        gui_state['backend_exception'] = str(e)
+                    except Exception:
+                        pass
         except Exception:
             pass
 
