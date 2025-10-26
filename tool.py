@@ -158,8 +158,21 @@ async def send_paint_data(ws, interval_ms):
                 merged_data = get_merged_data()
                 if merged_data:
                     try:
-                        await ws.send(merged_data)
-                        logging.debug(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
+                        # 为避免单次发送过大导致阻塞或被服务器断开（服务端限制 32KB），对过大的合并数据进行切分发送
+                        MAX_PACKET = 32000
+                        if len(merged_data) <= MAX_PACKET:
+                            await ws.send(merged_data)
+                            logging.debug(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
+                        else:
+                            sent_total = 0
+                            # 逐块发送，并在两块之间短暂让出控制权以便处理心跳
+                            for start in range(0, len(merged_data), MAX_PACKET):
+                                chunk = merged_data[start:start + MAX_PACKET]
+                                await ws.send(chunk)
+                                sent_total += len(chunk)
+                                # 给事件循环机会处理入站消息（例如心跳），减少响应延迟
+                                await asyncio.sleep(0)
+                            logging.debug(f"已分块发送 {sent_total} 字节的绘画数据（分 {((sent_total-1)//MAX_PACKET)+1} 块）。")
                     except (websockets.exceptions.ConnectionClosed, 
                             websockets.exceptions.ConnectionClosedError, 
                             websockets.exceptions.ConnectionClosedOK) as e:

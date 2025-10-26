@@ -16,6 +16,7 @@ import threading
 from collections import OrderedDict, deque
 import multiprocessing
 import queue
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 全局配置 ---
 API_BASE_URL = "https://paintboard.luogu.me"
@@ -284,6 +285,8 @@ def load_config():
         # 填充默认值
         cfg.setdefault('paint_interval_ms', 20)
         cfg.setdefault('round_interval_seconds', 30)
+        # 程序自重启间隔（分钟），如果为 0 则禁用自动重启
+        cfg.setdefault('auto_restart_minutes', 30)
         cfg.setdefault('user_cooldown_seconds', 30)
         cfg.setdefault('users', [])
         
@@ -341,6 +344,8 @@ def load_config():
             ],
             "paint_interval_ms": 20,
             "round_interval_seconds": 3,
+            # 程序自重启时间，单位分钟（默认 30）；设置为 0 可禁用自动重启
+            "auto_restart_minutes": 30,
             "user_cooldown_seconds": 3,
             "log_level": "INFO",
             "images": [
@@ -509,6 +514,47 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             _saved_env[_k] = os.environ.pop(_k)
     if _saved_env:
         logging.debug("检测到环境代理变量，已临时清除以建立直接 WebSocket 连接。")
+    # 额外尝试：确保 NO_PROXY 包含目标域名与本地回环，方便在某些代理实现下绕过代理
+    try:
+        no_proxy = os.environ.get('NO_PROXY') or os.environ.get('no_proxy') or ''
+        add_hosts = ['paintboard.luogu.me', 'localhost', '127.0.0.1']
+        for h in add_hosts:
+            if h not in no_proxy:
+                no_proxy = (no_proxy + ',' + h) if no_proxy else h
+        os.environ['NO_PROXY'] = no_proxy
+        os.environ['no_proxy'] = no_proxy
+        logging.debug(f"已设置 NO_PROXY 为: {no_proxy}")
+    except Exception:
+        pass
+
+    # 诊断信息：在 Windows 下，Clash 等代理可能通过 WinHTTP 设置拦截请求，记录其状态以便排查
+    try:
+        import subprocess
+        # 指定编码并在解码错误时使用替换策略，避免在某些 Windows 环境下
+        # 因系统默认编码(GBK)无法解码某些字节导致 subprocess 内部 reader 线程抛出
+        # UnicodeDecodeError 而中断。encoding='utf-8' 更能兼容常见输出，errors='replace'
+        # 会用替换字符替代无法解码的字节。
+        try:
+            proc = subprocess.run(
+                ['netsh', 'winhttp', 'show', 'proxy'],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='replace'
+            )
+        except TypeError:
+            # 兼容性回退：某些 Python 版本或环境可能不支持 encoding/errors 参数
+            proc = subprocess.run(['netsh', 'winhttp', 'show', 'proxy'], capture_output=True, text=True)
+
+        if proc.returncode == 0:
+            winhttp_out = (proc.stdout or '').strip()
+            if winhttp_out:
+                logging.debug(f"WinHTTP 代理状态:\n{winhttp_out}")
+        else:
+            logging.debug('无法获取 WinHTTP 代理状态')
+    except Exception:
+        # 在非 Windows 平台或无 netsh 可用时忽略
+        pass
 
     # 记录本次连接开始时间，供上层决定是否重置退避
     conn_started_at = time.monotonic()
@@ -548,7 +594,9 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             # 维护当前画板已知颜色状态（初始化为服务端快照，以便重启后立即知道已达成的像素）
             board_state = {}
             try:
-                snapshot = tool.fetch_board_snapshot()
+                # fetch_board_snapshot 使用 requests，会阻塞线程；改为放到线程池中执行，避免阻塞 asyncio 事件循环
+                loop = asyncio.get_running_loop()
+                snapshot = await loop.run_in_executor(None, tool.fetch_board_snapshot)
                 if snapshot:
                     # 使用完整快照，便于 GUI 显示整个画板
                     board_state = snapshot.copy()
@@ -625,18 +673,22 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
 
                                     # 处理 ping 进程的响应
                                     if isinstance(resp, dict) and resp.get('cmd') == 'send_pong':
-                                        try:
-                                            await ws.send(bytes([0xfb]))
-                                            consecutive_errors = 0
-                                        except Exception as e:
-                                            err_msg = str(e) if str(e) else e.__class__.__name__
-                                            logging.warning(f"发送 Pong 时出错: {err_msg}")
-                                            consecutive_errors += 1
-                                            if consecutive_errors >= max_consecutive_errors:
-                                                logging.error("心跳处理连续失败，接收任务退出。")
-                                                if 'ping_proc' in locals() and ping_proc is not None:
-                                                    logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)}")
-                                                return
+                                            try:
+                                                # 记录收到 ping 的时间并在发送后记录响应时延，便于诊断
+                                                t_recv = time.monotonic()
+                                                await ws.send(bytes([0xfb]))
+                                                t_sent = time.monotonic()
+                                                logging.debug(f"心跳: 收到 ping -> 发送 pong, 延迟: {(t_sent - t_recv)*1000:.2f}ms")
+                                                consecutive_errors = 0
+                                            except Exception as e:
+                                                err_msg = str(e) if str(e) else e.__class__.__name__
+                                                logging.warning(f"发送 Pong 时出错: {err_msg}")
+                                                consecutive_errors += 1
+                                                if consecutive_errors >= max_consecutive_errors:
+                                                    logging.error("心跳处理连续失败，接收任务退出。")
+                                                    if 'ping_proc' in locals() and ping_proc is not None:
+                                                        logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)}")
+                                                    return
                                     elif isinstance(resp, dict) and resp.get('cmd') == 'restart':
                                         logging.warning("Ping 进程请求重启主进程")
                                         try:
@@ -646,7 +698,10 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                     else:
                                         # 回退：立即在当前连接上发送 Pong（保证实时性）
                                         try:
+                                            t_recv = time.monotonic()
                                             await ws.send(bytes([0xfb]))
+                                            t_sent = time.monotonic()
+                                            logging.debug(f"心跳(fallback): 收到 ping -> 发送 pong, 延迟: {(t_sent - t_recv)*1000:.2f}ms")
                                             consecutive_errors = 0
                                         except Exception as e:
                                             err_msg = str(e) if str(e) else e.__class__.__name__
@@ -1377,19 +1432,38 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
                 def fetch_tokens_sync():
                     new_list = []
                     users_cfg = config.get('users', []) if isinstance(config, dict) else []
-                    for u in users_cfg:
-                        uid = u.get('uid')
-                        ak = u.get('access_key')
-                        token = None
-                        if ak:
+                    if not users_cfg:
+                        return new_list
+
+                    max_workers_local = min(32, max(1, len(users_cfg)))
+                    with ThreadPoolExecutor(max_workers=max_workers_local) as ex:
+                        future_to_user = {}
+                        for u in users_cfg:
+                            uid = u.get('uid')
+                            ak = u.get('access_key')
+                            if ak:
+                                fut = ex.submit(get_token, uid, ak)
+                            else:
+                                token_cfg = u.get('token')
+                                fut = ex.submit(lambda t=token_cfg: t)
+                            future_to_user[fut] = u
+
+                        for fut in as_completed(future_to_user):
+                            u = future_to_user[fut]
+                            uid = u.get('uid')
+                            ak = u.get('access_key')
                             try:
-                                token = get_token(uid, ak)
+                                token = fut.result()
                             except Exception:
                                 token = None
-                        else:
-                            token = u.get('token')
-                        if token:
-                            new_list.append({'uid': uid, 'token': token})
+                            if token:
+                                new_list.append({'uid': uid, 'token': token})
+                            else:
+                                if ak:
+                                    logging.warning(f"刷新 token 失败 uid={uid}")
+                                else:
+                                    logging.debug(f"无 access_key，使用配置内回退 token: uid={uid}")
+
                     return new_list
 
                 try:
@@ -1621,52 +1695,61 @@ def main(args):
         # 使用 CLI 进度显示（始终采用命令行输出，不创建任何 Tk 窗口）
         progress = None
         root = None
+        # 并发获取 token：对带 access_key 的用户并行调用 get_token，
+        # 对不带 access_key 的用户直接取配置中 token（回退）
+        if total == 0:
+            return []
 
+        max_workers = min(32, max(1, total))
         idx = 0
-        for user in users_list:
-            uid = user.get('uid')
-            ak = user.get('access_key')
-            token = None
-            token_from_config = user.get('token')
-            now_ts = int(time.time())
-            # 若配置中有 access_key，则每次启动都通过接口获取真实 token（不写回到 config.json）
-            if ak:
-                fetched = None
-                try:
-                    fetched = get_token(uid, ak)
-                except Exception:
-                    fetched = None
-                if fetched:
-                    token = fetched
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_to_user = {}
+            for user in users_list:
+                uid = user.get('uid')
+                ak = user.get('access_key')
+                if ak:
+                    fut = ex.submit(get_token, uid, ak)
                 else:
-                    logging.warning(f"无法通过 access_key 获取 token: uid={uid}，该用户将被跳过。")
-            else:
-                # 无 access_key，若配置含 token（仅作回退使用），则使用但不保存到 config
-                if token_from_config:
-                    token = token_from_config
-                else:
-                    logging.warning(f"用户条目缺少 access_key 且未提供 token: uid={uid}，跳过。")
-            # 已处理 access_key / 无 access_key 的情况（不再向 config 写入 token）
+                    # 直接返回配置中的 token（可能为 None）
+                    token_from_config = user.get('token')
+                    fut = ex.submit(lambda t=token_from_config: t)
+                future_to_user[fut] = user
 
-            if token:
-                results.append({'uid': uid, 'token': token})
-            idx += 1
-            # CLI 进度输出
-            sys.stdout.write(f'获取 token 进度: {idx}/{total}\r')
-            sys.stdout.flush()
+            for fut in as_completed(future_to_user):
+                user = future_to_user[fut]
+                uid = user.get('uid')
+                ak = user.get('access_key')
+                token = None
+                try:
+                    token = fut.result()
+                except Exception:
+                    token = None
+                if token:
+                    results.append({'uid': uid, 'token': token})
+                else:
+                    if ak:
+                        logging.warning(f"无法通过 access_key 获取 token: uid={uid}，该用户将被跳过。")
+                    else:
+                        logging.warning(f"用户条目缺少 access_key 且未提供 token: uid={uid}，跳过。")
+
+                idx += 1
+                # CLI 进度输出
+                try:
+                    sys.stdout.write(f'获取 token 进度: {idx}/{total}\r')
+                    sys.stdout.flush()
+                except Exception:
+                    pass
 
         # 换行完成进度输出
         print('')
         return results
 
     users_with_tokens = get_tokens_with_progress(config.get('users', []), allow_gui=True)
-    
+
+    # 移除 WebUI 后：如果没有可用 token 直接退出，避免尝试启动前端
     if not users_with_tokens:
-        if cli_only:
-            logging.error("没有可用的用户 Token，程序退出（CLI 模式）。")
-            return
-        else:
-            logging.warning("当前没有可用的用户 Token，进入 GUI 模式以便手动添加/填写 Token。继续启动 GUI...")
+        logging.error("没有可用的用户 Token，程序退出。")
+        return
 
     # 根据 -debug 决定控制台日志行为：非 debug 模式下把 StreamHandler 设为 WARNING，以便只显示进度条
     if not debug:
@@ -1679,129 +1762,75 @@ def main(args):
         logging.getLogger().setLevel(logging.DEBUG)
 
     try:
-        webui_available = False
-        start_webui_func = None
-        
-        if not cli_only:
-            # 尝试加载 WebUI
+        # 已移除 WebUI 后：直接以稳定的后台/CLI 模式运行主循环
+        # 启动自动重启线程（如果配置中启用）
+        restart_stop_event = threading.Event()
+        def _auto_restart_worker(minutes, stop_evt):
             try:
-                import web_gui
-                start_webui_func = web_gui.start_web_gui
-                webui_available = True
-                logging.info("WebUI 模块已加载")
-            except Exception as e:
-                logging.warning(f"WebUI 不可用，将使用 CLI 模式：{e}")
-                cli_only = True
+                m = float(minutes)
+            except Exception:
+                return
+            if m <= 0:
+                return
+            secs = m * 60.0
+            # 分段睡眠以便能及时响应 stop_evt
+            slept = 0.0
+            interval = 1.0
+            try:
+                while slept < secs and not stop_evt.is_set():
+                    to_sleep = min(interval, secs - slept)
+                    time.sleep(to_sleep)
+                    slept += to_sleep
+            except Exception:
+                return
+            if stop_evt.is_set():
+                return
+            try:
+                logging.info(f"自动重启倒计时已到 ({m} 分钟)，触发重启...")
+            except Exception:
+                pass
+            try:
+                tool.restart_script()
+            except Exception:
+                logging.exception("触发自动重启时出错")
 
-        # 定义刷新配置函数（仅刷新图片配置，不重新获取 token）
-        def refresh_config(new_cfg: dict):
-            """在不重新获取 token 的情况下刷新运行期配置并更新 GUI 状态。"""
-            try:
-                # 保存到文件
-                save_config(new_cfg)
-            except Exception:
-                logging.exception('保存配置失败')
-            # 更新内存中的 config 引用
-            nonlocal config, images_data
-            config.update(new_cfg)
-            # 重新加载所有图片
-            try:
-                # Always update images_data with the latest result (may be empty list)
-                new_images_data = tool.load_all_images(config) or []
-                images_data = new_images_data
-                if images_data:
-                    logging.info('已刷新所有图片数据（未重新获取 Token）。')
-                else:
-                    logging.warning('刷新配置时未能加载到任何图片（可能都被禁用或路径无效）。')
-            except Exception:
-                logging.exception('刷新配置时加载图片失败')
-            # 如果 WebUI 可用，更新 gui_state 的相关字段
-            try:
-                if webui_available and 'gui_state' in locals():
-                    with gui_state['lock']:
-                        # Update gui_state even if images_data is empty so backend rebuilds its maps
-                        gui_state['images_data'] = images_data
-                        gui_state['reload_pixels'] = True
-            except Exception:
-                logging.exception('刷新配置时更新 GUI 状态失败')
-
-        # 将刷新回调注册到 web_gui 模块
+        auto_minutes = 0
         try:
-            if webui_available:
-                import web_gui
-                web_gui.REFRESH_CALLBACK = refresh_config
+            auto_minutes = int(config.get('auto_restart_minutes', 0)) if isinstance(config, dict) else 0
         except Exception:
-            pass
+            try:
+                auto_minutes = int(float(config.get('auto_restart_minutes')))
+            except Exception:
+                auto_minutes = 0
 
-        if cli_only or not webui_available:
-            # CLI 模式：使用带重连的持久运行
-            asyncio.run(run_forever(config, users_with_tokens, images_data, debug))
-        else:
-            # WebUI 模式：创建线程安全的 gui_state 并在后台运行 asyncio
-            gui_state = {
-                'lock': threading.RLock(),
-                'stop': False,
-                'board_state': {},
-                'overlay': False,
-                'images_data': images_data,
-                'log_to_web': lambda msg: None, # 初始为空函数
-                # 后端运行状态：online / restarting / exception
-                'backend_status': 'online',
-                'backend_exception': ''
-            }
-
-            # 定义重启函数
-            def restart_app():
-                logging.info("正在执行重启...")
-                # 标记停止，以便正常关闭现有线程
-                with gui_state['lock']:
-                    gui_state['stop'] = True
-                    # 标记后端正在重启（供前端显示）
-                    try:
-                        gui_state['backend_status'] = 'restarting'
-                    except Exception:
-                        pass
-                # 等待一小段时间让线程退出
-                time.sleep(2)
-                # 使用 os.execv 重启进程
-                try:
-                    os.execv(sys.executable, ['python'] + sys.argv)
-                except Exception as e:
-                    logging.error(f"重启失败: {e}")
-                    sys.exit(1) # 如果 execv 失败，则退出
-
-            def run_asyncio_loop():
-                try:
-                    asyncio.run(run_forever(config, users_with_tokens, images_data, debug, gui_state=gui_state))
-                except Exception:
-                    logging.exception('后台 asyncio 任务异常')
-
-            t = threading.Thread(target=run_asyncio_loop, daemon=True)
+        if auto_minutes and auto_minutes > 0:
+            t = threading.Thread(target=_auto_restart_worker, args=(auto_minutes, restart_stop_event), daemon=True, name='AutoRestartThread')
             t.start()
 
-            # 启动 WebUI（主线程）
-            try:
-                port = args.port
-                logging.info(f"准备启动 WebUI 在端口 {port}")
-                start_webui_func(config, images_data, users_with_tokens, gui_state, port=port, restart_callback=restart_app)
-            finally:
-                # WebUI 关闭时请求后台停止
-                with gui_state['lock']:
-                    gui_state['stop'] = True
-                t.join(timeout=5)
-                logging.info('WebUI 退出，后台任务已请求停止。')
+        asyncio.run(run_forever(config, users_with_tokens, images_data, debug))
     except Exception as e:
         # 捕获顶层未处理异常，记录日志并尝试优雅停止后台任务
         logging.exception(f"主程序发生未处理异常: {e}")
+        # 通过 locals().get 获取 gui_state，避免在没有该变量时触发静态分析错误
         try:
-            if 'gui_state' in locals():
-                with gui_state['lock']:
-                    gui_state['stop'] = True
-                    try:
-                        gui_state['backend_status'] = 'exception'
-                        gui_state['backend_exception'] = str(e)
-                    except Exception:
-                        pass
+            gs = locals().get('gui_state')
+            if gs:
+                try:
+                    with gs['lock']:
+                        gs['stop'] = True
+                        try:
+                            gs['backend_status'] = 'exception'
+                            gs['backend_exception'] = str(e)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    finally:
+        # 程序退出时通知自动重启线程取消（如果存在）
+        try:
+            restart_stop_event.set()
         except Exception:
             pass
 
