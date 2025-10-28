@@ -17,6 +17,8 @@ from collections import OrderedDict, deque
 import multiprocessing
 import queue
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRemainingColumn
 
 # --- 全局配置 ---
 API_BASE_URL = "https://paintboard.luogu.me"
@@ -830,148 +832,142 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
 
             # 启动进度显示器（每秒刷新）
             async def progress_printer():
-                # 模式前缀：显示多图片信息
+                # 使用 rich 渲染更美观的进度条
                 mode_prefix = f"[{len(images_data)}图] "
-                # history of (time, pct) for averaging over window_seconds
                 history = deque()
                 window_seconds = 60.0
-                while True:
-                    # 计算完成度（不符合的像素数会降低完成度）
-                    total = len(target_positions)
-                    mismatched = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
-                    completed = max(0, total - mismatched)
-                    pct = (completed / total * 100) if total > 0 else 100.0
 
-                    # 可用用户数与就绪数
-                    now = time.monotonic()
-                    available = len(users_with_tokens)
-                    ready_count = len([u for u in users_with_tokens if cooldown_until.get(u['uid'], 0.0) <= now])
+                console = Console()
+                progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("{task.description}"),
+                    BarColumn(bar_width=40),
+                    TextColumn("{task.percentage:>3.0f}%"),
+                    TimeRemainingColumn(),
+                    console=console,
+                    transient=False,
+                )
+                task_id = progress.add_task(f"{mode_prefix}进度", total=100)
+                progress.start()
+                try:
+                    while True:
+                        # 计算完成度（不符合的像素数会降低完成度）
+                        total = len(target_positions)
+                        mismatched = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
+                        completed = max(0, total - mismatched)
+                        pct = (completed / total * 100) if total > 0 else 100.0
 
-                    # 计算用户级“被覆盖率”并得出全局抵抗率
-                    resistance_pct = None
-                    user_covered = {}
-                    try:
-                        total_users = len(users_with_tokens)
-                        covered = 0
-                        for u in users_with_tokens:
-                            uid = u['uid']
-                            snap = user_last_snapshot.get(uid)
-                            covered_flag = False
-                            if snap and len(snap) > 0:
-                                for pos, color in snap.items():
-                                    cur = board_state.get(pos)
-                                    if cur is None or cur != color:
-                                        covered_flag = True
-                                        break
-                            else:
-                                covered_flag = False
-                            user_covered[uid] = covered_flag
-                            if covered_flag:
-                                covered += 1
-                        if total_users > 0:
-                            resistance_pct = (covered / total_users) * 100.0
-                        else:
-                            resistance_pct = None
-                    except Exception:
+                        # 可用用户数与就绪数
+                        now = time.monotonic()
+                        available = len(users_with_tokens)
+                        ready_count = len([u for u in users_with_tokens if cooldown_until.get(u['uid'], 0.0) <= now])
+
+                        # 计算抵抗率
                         resistance_pct = None
-                        user_covered = {}
+                        try:
+                            total_users = len(users_with_tokens)
+                            covered = 0
+                            for u in users_with_tokens:
+                                uid = u['uid']
+                                snap = user_last_snapshot.get(uid)
+                                covered_flag = False
+                                if snap and len(snap) > 0:
+                                    for pos, color in snap.items():
+                                        cur = board_state.get(pos)
+                                        if cur is None or cur != color:
+                                            covered_flag = True
+                                            break
+                                user_covered = covered_flag
+                                if covered_flag:
+                                    covered += 1
+                            if total_users > 0:
+                                resistance_pct = (covered / total_users) * 100.0
+                        except Exception:
+                            resistance_pct = None
 
-                    # 更新 GUI 状态
-                    if gui_state is not None:
-                        with gui_state['lock']:
-                            gui_state['total'] = total
-                            gui_state['mismatched'] = mismatched
-                            gui_state['available'] = len(users_with_tokens)
-                            gui_state['ready_count'] = ready_count
-                            gui_state['resistance_pct'] = resistance_pct
-                            gui_state['user_covered'] = user_covered
-                            # 显示累计派发次数（配置索引 -> 次数）
-                            try:
-                                gui_state['assigned_per_image'] = dict(assigned_counter_per_image)
-                            except Exception:
-                                gui_state['assigned_per_image'] = {}
+                        # 更新 GUI 状态
+                        if gui_state is not None:
+                            with gui_state['lock']:
+                                gui_state['total'] = total
+                                gui_state['mismatched'] = mismatched
+                                gui_state['available'] = len(users_with_tokens)
+                                gui_state['ready_count'] = ready_count
+                                gui_state['resistance_pct'] = resistance_pct
 
-                    # 进度条文本与条形
-                    bar_len = 40
-                    filled = int(bar_len * completed / total) if total > 0 else bar_len
-                    bar = '#' * filled + '-' * (bar_len - filled)
-
-
-                    # maintain history and compute average growth over last window_seconds
-                    try:
-                        history.append((now, pct))
-                        # drop older than window
-                        while history and (now - history[0][0] > window_seconds):
-                            history.popleft()
-                        growth = None
-                        growth_str = ''
-                        eta_str = ''
-                        if len(history) >= 2:
-                            t0, p0 = history[0]
-                            t1, p1 = history[-1]
-                            dt = max(1e-6, t1 - t0)
-                            growth = (p1 - p0) / dt
-                        if growth is None:
-                            growth_str = '  增长: --'
-                        else:
-                            growth_str = f'  增长: {growth:+.2f}%/s'
-                            if growth > 1e-6:
-                                remain_pct = max(0.0, 100.0 - pct)
-                                eta_s = remain_pct / growth
-                                if eta_s >= 3600:
-                                    eta_str = f'  估计剩余: {int(eta_s//3600)}h{int((eta_s%3600)//60)}m'
-                                elif eta_s >= 60:
-                                    eta_str = f'  估计剩余: {int(eta_s//60)}m{int(eta_s%60)}s'
-                                else:
-                                    eta_str = f'  估计剩余: {int(eta_s)}s'
+                        # maintain history and compute average growth
+                        try:
+                            history.append((now, pct))
+                            while history and (now - history[0][0] > window_seconds):
+                                history.popleft()
+                            growth = None
+                            growth_str = ''
+                            eta_str = ''
+                            if len(history) >= 2:
+                                t0, p0 = history[0]
+                                t1, p1 = history[-1]
+                                dt = max(1e-6, t1 - t0)
+                                growth = (p1 - p0) / dt
+                            if growth is None:
+                                growth_str = '  增长: --'
                             else:
-                                if pct < 95.0:
-                                    eta_str = '  估计剩余: 我们正在被攻击，无法抵抗'
+                                growth_str = f'  增长: {growth:+.2f}%/s'
+                                if growth > 1e-6:
+                                    remain_pct = max(0.0, 100.0 - pct)
+                                    eta_s = remain_pct / growth
+                                    if eta_s >= 3600:
+                                        eta_str = f'  估计剩余: {int(eta_s//3600)}h{int((eta_s%3600)//60)}m'
+                                    elif eta_s >= 60:
+                                        eta_str = f'  估计剩余: {int(eta_s//60)}m{int(eta_s%60)}s'
+                                    else:
+                                        eta_str = f'  估计剩余: {int(eta_s)}s'
                                 else:
-                                    eta_str = '  估计剩余: 即将完成'
-                    except Exception:
-                        growth_str = '  增长: --'
-                        eta_str = ''
+                                    if pct < 95.0:
+                                        eta_str = '  估计剩余: 我们正在被攻击，无法抵抗'
+                                    else:
+                                        eta_str = '  估计剩余: 即将完成'
+                        except Exception:
+                            growth_str = '  增长: --'
+                            eta_str = ''
 
-                    # 判断危险状态：增长为负且进度小于95%
-                    danger = False
-                    try:
-                        if growth is not None and growth < 0 and pct < 95.0:
-                            danger = True
-                    except Exception:
                         danger = False
+                        try:
+                            if growth is not None and growth < 0 and pct < 95.0:
+                                danger = True
+                        except Exception:
+                            danger = False
 
-                    # 构造最终输出行，优先包含抵抗率与增长/ETA
-                    try:
-                        if resistance_pct is None:
-                            res_part = '  |  抵抗率: --'
-                        else:
-                            res_part = f'  |  抵抗率: {resistance_pct:5.1f}%'
-                    except Exception:
-                        res_part = ''
+                        try:
+                            if resistance_pct is None:
+                                res_part = '抵抗率: --'
+                            else:
+                                res_part = f'抵抗率: {resistance_pct:5.1f}%'
+                        except Exception:
+                            res_part = ''
 
-                    # 将输出行写到控制台；在危险时把进度条染为红色（ANSI）
+                        # 构造描述并更新 progress
+                        danger_mark = ' ⚠️' if danger else ''
+                        desc = f"{mode_prefix}可用:{available} 就绪:{ready_count} 未达:{mismatched} | {res_part}{growth_str}{eta_str}{danger_mark}"
+                        try:
+                            progress.update(task_id, completed=pct, description=desc)
+                        except Exception:
+                            # 回退为直接输出
+                            out_line = f"{mode_prefix}进度: [{int(pct):3d}%] 可用:{available} (就绪:{ready_count}) 未达:{mismatched} {res_part}{growth_str}{eta_str}"
+                            if debug:
+                                logging.info(out_line)
+                            else:
+                                sys.stdout.write('\r' + out_line)
+                                sys.stdout.flush()
+
+                        # 若 GUI 请求停止则退出循环
+                        if gui_state is not None and gui_state.get('stop'):
+                            logging.info('收到 GUI 退出信号，结束调度循环。')
+                            return
+                        await asyncio.sleep(1)
+                finally:
                     try:
-                        if danger:
-                            red = '\x1b[31m'
-                            reset = '\x1b[0m'
-                            colored_bar = red + '[' + bar + ']' + reset
-                            out_line = f"{mode_prefix}进度: {colored_bar} {pct:6.2f}% 可用用户: {available} (就绪:{ready_count})  未达标: {mismatched}{res_part}{growth_str}{eta_str}"
-                        else:
-                            out_line = f"{mode_prefix}进度: [{bar}] {pct:6.2f}% 可用用户: {available} (就绪:{ready_count})  未达标: {mismatched}{res_part}{growth_str}{eta_str}"
-                        if debug:
-                            logging.info(out_line)
-                        else:
-                            sys.stdout.write('\r' + out_line)
-                            sys.stdout.flush()
+                        progress.stop()
                     except Exception:
                         pass
-
-                    # 若 GUI 请求停止则退出循环
-                    if gui_state is not None and gui_state.get('stop'):
-                        logging.info('收到 GUI 退出信号，结束调度循环。')
-                        return
-                    await asyncio.sleep(1)
 
             # 调度：支持冷却与持续监视
             user_counters = {u['uid']: 0 for u in users_with_tokens}
@@ -1692,8 +1688,7 @@ def main(args):
     def get_tokens_with_progress(users_list, allow_gui=True):
         results = []
         total = len(users_list)
-        # 使用 CLI 进度显示（始终采用命令行输出，不创建任何 Tk 窗口）
-        progress = None
+        # 使用 rich 渲染 CLI 进度条
         root = None
         # 并发获取 token：对带 access_key 的用户并行调用 get_token，
         # 对不带 access_key 的用户直接取配置中 token（回退）
@@ -1715,30 +1710,27 @@ def main(args):
                     fut = ex.submit(lambda t=token_from_config: t)
                 future_to_user[fut] = user
 
-            for fut in as_completed(future_to_user):
-                user = future_to_user[fut]
-                uid = user.get('uid')
-                ak = user.get('access_key')
-                token = None
-                try:
-                    token = fut.result()
-                except Exception:
+            # 使用 rich Progress 显示更友好的进度条
+            from rich.progress import Progress as _Progress, SpinnerColumn as _SpinnerColumn, BarColumn as _BarColumn, TextColumn as _TextColumn
+            with _Progress(_SpinnerColumn(), _TextColumn("获取 token: {task.completed}/{task.total}"), _BarColumn(), _TextColumn("{task.percentage:>3.0f}%")) as p:
+                task = p.add_task("fetch", total=total)
+                for fut in as_completed(future_to_user):
+                    user = future_to_user[fut]
+                    uid = user.get('uid')
+                    ak = user.get('access_key')
                     token = None
-                if token:
-                    results.append({'uid': uid, 'token': token})
-                else:
-                    if ak:
-                        logging.warning(f"无法通过 access_key 获取 token: uid={uid}，该用户将被跳过。")
+                    try:
+                        token = fut.result()
+                    except Exception:
+                        token = None
+                    if token:
+                        results.append({'uid': uid, 'token': token})
                     else:
-                        logging.warning(f"用户条目缺少 access_key 且未提供 token: uid={uid}，跳过。")
-
-                idx += 1
-                # CLI 进度输出
-                try:
-                    sys.stdout.write(f'获取 token 进度: {idx}/{total}\r')
-                    sys.stdout.flush()
-                except Exception:
-                    pass
+                        if ak:
+                            logging.warning(f"无法通过 access_key 获取 token: uid={uid}，该用户将被跳过。")
+                        else:
+                            logging.warning(f"用户条目缺少 access_key 且未提供 token: uid={uid}，跳过。")
+                    p.advance(task)
 
         # 换行完成进度输出
         print('')

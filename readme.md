@@ -2,7 +2,7 @@
 
 轻量的 冬日绘板2026 绘制器后端 + WebUI 界面。
 
-包含基于 Flask 的 WebUI 界面，支持多个绘制模式，良好性能，可远程访问。
+包含基于 Flask 的 WebUI 界面，支持多个绘制模式，良好性能。
 
 功能包含
 
@@ -75,3 +75,17 @@ python main.py -debug
 - `start_x`, `start_y`: 目标图片在画板上的起点坐标（0-based）。
 - `paint_interval_ms`, `round_interval_seconds`, `user_cooldown_seconds`: 绘制/调度相关时间参数。
 我需要哪些额外信息，我会继续完善。
+
+## 进度条美化说明
+
+本项目已改用 `rich` 在命令行渲染更美观的进度条和状态信息。若要本地运行并看到新进度条，请先安装依赖：
+
+```powershell
+pip install -r requirements.txt
+# 或单独安装 rich
+pip install rich
+```
+
+运行时，进度条会在控制台中实时显示获取 token 的进度与主循环的绘制进度（包含完成度、未达标数、可用/就绪用户、抵抗率与 ETA）。
+
+如果你希望恢复旧的纯文本进度输出或在某些终端遇到兼容问题，可在 `main.py` 中回退为 stdout 输出（已实现回退逻辑）。
