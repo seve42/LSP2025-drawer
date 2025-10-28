@@ -17,6 +17,12 @@ import websockets
 paint_queue = []
 total_size = 0
 
+# 视频播放全局状态（用于将视频帧作为动态图片注入调度）
+# 格式示例： { 'video_id_or_folder': { 'folder': 'badapple', 'frame': 1, 'frame_count': 300, 'fps': 12.0 } }
+VIDEO_STATE = {}
+# 当后台更新了视频帧后，将此标志设为 True，调用方（main.handle_websocket）会检测并重新构建目标映射
+VIDEO_FRAME_UPDATED = False
+
 def append_to_queue(paint_data):
     """将绘画数据添加到粘包队列"""
     global paint_queue, total_size
@@ -117,30 +123,30 @@ def filter_pong_from_data(data):
     return bytes(result) if len(result) > 0 else None
 
 
-async def paint(ws, uid, token, r, g, b, x, y, paint_id):
-    """准备绘画数据并加入队列（非阻塞）"""
+def paint(ws, uid, token_bytes, uid_bytes3, r, g, b, x, y, paint_id):
+    """准备绘画数据并加入队列（轻量同步函数，避免不必要的 await）
+
+    该函数对每次绘画只进行本地内存操作并立即返回，期望调用方在事件循环中
+    或线程中以非阻塞方式调用它。调用方应负责心跳与发送任务的并发执行。
+    要求传入已预计算的 token_bytes (16 bytes) 与 uid_bytes3 (3 bytes)，以减少开销。
+    """
     try:
-        try:
-            token_bytes = UUID(token).bytes
-        except Exception:
-            try:
-                token_bytes = UUID(hex=token.replace('-', '')).bytes
-            except Exception as e:
-                logging.error(f"无效的 Token 格式: {token}，创建 UUID 失败: {e}")
-                return
+        # 构造固定长度的字节包（31 字节），并直接填充切片以降低中间对象分配
         paint_data = bytearray(31)
         paint_data[0] = 0xfe
         paint_data[1:3] = x.to_bytes(2, 'little')
         paint_data[3:5] = y.to_bytes(2, 'little')
-        paint_data[5:8] = [r, g, b]
-        paint_data[8:11] = uid.to_bytes(3, 'little')
+        paint_data[5:8] = bytes((r, g, b))
+        # uid_bytes3 应为 3 字节的小端表示
+        paint_data[8:11] = uid_bytes3
+        # token_bytes 应为 16 字节
         paint_data[11:27] = token_bytes
         paint_data[27:31] = paint_id.to_bytes(4, 'little')
         append_to_queue(paint_data)
     except Exception as e:
         logging.error(f"创建绘画数据时出错: {e}")
 
-async def send_paint_data(ws, interval_ms):
+async def send_paint_data(ws, interval_ms, wake_event=None):
     """定时发送粘合后的绘画数据包（后台任务）
     
     【关键修复】此任务应持续运行直到被取消（WebSocket 上下文结束时自动取消）
@@ -150,14 +156,40 @@ async def send_paint_data(ws, interval_ms):
     3. 如果此任务提前退出，Pong 将永远无法发送，导致 Ping timeout
     """
     try:
+        last_send = 0.0
         while True:
-            await asyncio.sleep(interval_ms / 1000.0)
-            
+            # 如果队列为空，优先通过事件驱动等待以减少轮询 sleep
+            if not paint_queue:
+                if wake_event is not None:
+                    try:
+                        await wake_event.wait()
+                        # 清理事件并继续尝试发送
+                        try:
+                            wake_event.clear()
+                        except Exception:
+                            pass
+                        # 小的让步，防止发送任务被立即再次唤醒形成忙循环
+                        await asyncio.sleep(0)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        # 回退为定时 sleep
+                        await asyncio.sleep(interval_ms / 1000.0)
+                else:
+                    await asyncio.sleep(interval_ms / 1000.0)
+
             # 检查是否有数据需要发送
             if paint_queue:
                 merged_data = get_merged_data()
                 if merged_data:
                     try:
+                        # respect minimal send interval to avoid exceeding per-connection packet rate
+                        now = time.monotonic()
+                        min_interval = interval_ms / 1000.0
+                        elapsed = now - last_send
+                        if elapsed < min_interval:
+                            await asyncio.sleep(min_interval - elapsed)
+                        last_send = time.monotonic()
                         # 为避免单次发送过大导致阻塞或被服务器断开（服务端限制 32KB），对过大的合并数据进行切分发送
                         MAX_PACKET = 32000
                         if len(merged_data) <= MAX_PACKET:
@@ -539,32 +571,146 @@ def merge_target_maps(images_data):
     # 映射每个绝对坐标到最终被采纳的图片索引（images_data 中的索引）
     pos_to_image_idx = {}
 
-    for orig_idx, cfg_idx, img_data in sorted_images:
-        pixels = img_data['pixels']
-        width = img_data['width']
-        height = img_data['height']
-        start_x = img_data['start_x']
-        start_y = img_data['start_y']
-        draw_mode = img_data['draw_mode']
-        
-        # 构建该图片的目标映射
-        target_map = build_target_map(pixels, width, height, start_x, start_y)
-        
-        # 生成绘制顺序
-        ordered_coords = get_draw_order(draw_mode, width, height)
-        
-        # 转换为绝对坐标并记录
-        if draw_mode not in positions_by_mode:
-            positions_by_mode[draw_mode] = []
-            
-        for x, y in ordered_coords:
-            abs_pos = (start_x + x, start_y + y)
-            if abs_pos in target_map:
-                # 只有当该位置还未被更高权重的图片占用时才添加
-                if abs_pos not in combined_target_map:
+    # 按权重分组后合并，同权重图片采用交错分配以保证公平性（避免始终优先列表中靠前的图片）
+    from itertools import groupby
+    # sorted_images 已按 weight (desc) 排序；groupby 需要按相同键连续，因此可直接使用
+    for weight, group in groupby(sorted_images, key=lambda it: it[2].get('weight', 1.0)):
+        group_list = list(group)
+        # 单图组直接按原逻辑处理（效率最高）
+        if len(group_list) == 1:
+            orig_idx, cfg_idx, img_data = group_list[0]
+            # 支持动态视频条目（type == 'video'）：从 VIDEO_STATE 中获取当前帧并加载像素
+            if str(img_data.get('type', '')).lower() == 'video':
+                folder = img_data.get('folder') or img_data.get('image_path')
+                vs = VIDEO_STATE.get(folder)
+                if vs and vs.get('files'):
+                    try:
+                        # frame 存为 1-based
+                        frame_idx = max(0, int(vs.get('frame', 1)) - 1)
+                        frame_path = vs['files'][frame_idx % len(vs['files'])]
+                        img = Image.open(frame_path).convert('RGBA')
+                        width, height = img.size
+                        pixels = list(img.getdata())
+                    except Exception:
+                        logging.exception(f"加载视频帧失败: {folder}")
+                        continue
+                else:
+                    logging.warning(f"视频状态未初始化或无帧: {folder}")
+                    continue
+            else:
+                pixels = img_data['pixels']
+                width = img_data['width']
+                height = img_data['height']
+            start_x = img_data['start_x']
+            start_y = img_data['start_y']
+            draw_mode = img_data['draw_mode']
+
+            target_map = build_target_map(pixels, width, height, start_x, start_y)
+
+            # 优化：对于 random 模式，仅对实际有目标像素的位置进行打乱，
+            # 避免为整个像素区域生成并 shuffle 完整坐标列表（节省时间与内存）。
+            if str(draw_mode).lower() == 'random':
+                rel_coords = []
+                # 从 target_map 的绝对坐标构建相对坐标列表
+                for (ax, ay) in target_map.keys():
+                    rx = ax - start_x
+                    ry = ay - start_y
+                    if 0 <= rx < width and 0 <= ry < height:
+                        rel_coords.append((rx, ry))
+                rnd = random.Random(width * 10007 + height * 97)
+                rnd.shuffle(rel_coords)
+                ordered_coords = rel_coords
+            else:
+                ordered_coords = get_draw_order(draw_mode, width, height)
+
+            if draw_mode not in positions_by_mode:
+                positions_by_mode[draw_mode] = []
+
+            for x, y in ordered_coords:
+                abs_pos = (start_x + x, start_y + y)
+                if abs_pos in target_map and abs_pos not in combined_target_map:
                     combined_target_map[abs_pos] = target_map[abs_pos]
                     positions_by_mode[draw_mode].append(abs_pos)
-                    # 使用配置索引，保证与 GUI 列表一致
                     pos_to_image_idx[abs_pos] = cfg_idx
+            continue
+
+        # 多图组（权重相等）：为避免列表先后带来的偏好，按图片交错分配像素
+        # 先为每张图片生成其绝对坐标列表（按各自 draw_mode 的顺序）
+        per_image_entries = []  # list of dicts: {cfg_idx, draw_mode, abs_coords, target_map}
+        for orig_idx, cfg_idx, img_data in group_list:
+            # 支持 video 类型：按当前帧加载像素
+            if str(img_data.get('type', '')).lower() == 'video':
+                folder = img_data.get('folder') or img_data.get('image_path')
+                vs = VIDEO_STATE.get(folder)
+                if vs and vs.get('files'):
+                    try:
+                        frame_idx = max(0, int(vs.get('frame', 1)) - 1)
+                        frame_path = vs['files'][frame_idx % len(vs['files'])]
+                        img = Image.open(frame_path).convert('RGBA')
+                        width, height = img.size
+                        pixels = list(img.getdata())
+                    except Exception:
+                        logging.exception(f"加载视频帧失败: {folder}")
+                        pixels = []
+                        width = 0
+                        height = 0
+                else:
+                    logging.warning(f"视频状态未初始化或无帧: {folder}")
+                    pixels = []
+                    width = 0
+                    height = 0
+            else:
+                pixels = img_data['pixels']
+                width = img_data['width']
+                height = img_data['height']
+            start_x = img_data['start_x']
+            start_y = img_data['start_y']
+            draw_mode = img_data['draw_mode']
+
+            tmap = build_target_map(pixels, width, height, start_x, start_y)
+
+            # 对于 random 模式，直接从 tmap 的绝对坐标中挑选并打乱，避免对整个图片坐标进行无谓处理
+            if str(draw_mode).lower() == 'random':
+                abs_coords = []
+                for (ax, ay) in tmap.keys():
+                    # 只收集属于当前图片位置区间的绝对坐标
+                    if start_x <= ax < start_x + width and start_y <= ay < start_y + height:
+                        abs_coords.append((ax, ay))
+                rnd = random.Random(width * 10007 + height * 97)
+                rnd.shuffle(abs_coords)
+            else:
+                ordered = get_draw_order(draw_mode, width, height)
+                abs_coords = []
+                for x, y in ordered:
+                    abs_pos = (start_x + x, start_y + y)
+                    if abs_pos in tmap:
+                        abs_coords.append(abs_pos)
+
+            per_image_entries.append({
+                'cfg_idx': cfg_idx,
+                'draw_mode': draw_mode,
+                'abs_coords': abs_coords,
+                'target_map': tmap,
+            })
+
+        # 交错分配：轮流从每张图的 abs_coords 中取出一个位置并分配（若该位置尚未被占用）
+        any_left = True
+        idx = 0
+        while any_left:
+            any_left = False
+            for entry in per_image_entries:
+                if not entry['abs_coords']:
+                    continue
+                any_left = True
+                abs_pos = entry['abs_coords'].pop(0)
+                # 分配到 combined_target_map（若尚未被占用）
+                if abs_pos not in combined_target_map:
+                    combined_target_map[abs_pos] = entry['target_map'][abs_pos]
+                    dm = entry['draw_mode']
+                    if dm not in positions_by_mode:
+                        positions_by_mode[dm] = []
+                    positions_by_mode[dm].append(abs_pos)
+                    pos_to_image_idx[abs_pos] = entry['cfg_idx']
+            idx += 1
     
     return combined_target_map, positions_by_mode, pos_to_image_idx

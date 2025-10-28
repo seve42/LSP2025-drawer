@@ -12,7 +12,9 @@ from uuid import UUID
 from PIL import Image
 import tool
 import ping
+import seq_player
 import threading
+import re
 from collections import OrderedDict, deque
 import multiprocessing
 import queue
@@ -33,6 +35,27 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+
+def process_worker(idx, cfg, users_sub, images_sub, dbg):
+    """顶层函数：在子进程中启动独立的 asyncio 事件循环并运行 run_forever。
+
+    该函数需要位于模块顶层以便 multiprocessing 在 Windows 上能够正确导入并调用。
+    注意：images_sub 可能包含大量像素数据，会在进程间被序列化/复制。
+    """
+    import asyncio as _asyncio
+    try:
+        loop = _asyncio.new_event_loop()
+        _asyncio.set_event_loop(loop)
+        loop.run_until_complete(run_forever(cfg, users_sub, images_sub, dbg))
+    except Exception:
+        import logging as _logging
+        _logging.exception(f"进程 worker #{idx} 出现未处理异常")
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass
 
 # pending paints waiting for confirmation via board update: list of dicts {uid, paint_id, pos, color, time}
 pending_paints = []
@@ -591,7 +614,48 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                 pass
 
             # 启动定时发送任务（粘包）
-            sender_task = asyncio.create_task(tool.send_paint_data(ws, paint_interval_ms))
+            # 使用事件驱动：当有新的 paint 被 append 到队列时，调度器会 set 该事件以唤醒发送任务，
+            # 避免频繁轮询 sleep，从而减少不必要的等待（同时 send_paint_data 内仍会遵守 interval_ms 最小间隔以满足速率限制）。
+            paint_queue_event = asyncio.Event()
+            sender_task = asyncio.create_task(tool.send_paint_data(ws, paint_interval_ms, paint_queue_event))
+
+            # 根据配置启动额外的写连接以提高发送吞吐量（最多 16 线程/连接）
+            writeonly_connections = 1
+            try:
+                writeonly_connections = int(config.get('writeonly_connections', 1)) if isinstance(config, dict) else 1
+            except Exception:
+                writeonly_connections = 1
+            # 限制最大值以避免滥用资源
+            writeonly_connections = max(1, min(writeonly_connections, 16))
+
+            extra_writers = max(0, writeonly_connections - 1)
+            write_worker_tasks = []
+
+            async def write_only_worker(idx: int):
+                """单独的写连接任务：建立独立 WebSocket 连接并运行 send_paint_data 循环。
+
+                设计目标：分摊发送压力到多个连接，提高并发发送能力。遇到异常时记录并退出（上层会重连）。
+                """
+                try:
+                    async with websockets.connect(
+                        WS_URL,
+                        ping_interval=None,
+                        ping_timeout=None,
+                        open_timeout=30,
+                        close_timeout=10,
+                        max_size=10 * 1024 * 1024,
+                    ) as write_ws:
+                        logging.info(f"写连接 #{idx} 已建立")
+                        await tool.send_paint_data(write_ws, paint_interval_ms, paint_queue_event)
+                except Exception as e:
+                    logging.warning(f"写连接 #{idx} 异常退出: {e}")
+
+            for i in range(extra_writers):
+                try:
+                    t = asyncio.create_task(write_only_worker(i))
+                    write_worker_tasks.append(t)
+                except Exception:
+                    logging.exception(f"启动写连接任务 #{i} 失败")
 
             # 维护当前画板已知颜色状态（初始化为服务端快照，以便重启后立即知道已达成的像素）
             board_state = {}
@@ -612,6 +676,8 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                 logging.debug("初始化画板快照时出现异常，继续使用空的 board_state。")
             # 画板状态改变事件（用于唤醒调度器进行即时修复）
             state_changed_event = asyncio.Event()
+            # in-flight 集合：记录已分配但尚未被画板更新确认的位置，避免重复分配
+            inflight = set()
 
             # 启动独立的 Ping 处理进程（通过两个 multiprocessing.Queue 与之通信）
             try:
@@ -761,6 +827,11 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                         # 若更新触及目标区域，唤醒调度器以便即时修复
                                         if (x, y) in target_map:
                                             state_changed_event.set()
+                                            # 若该位置在 in-flight，则移除（已确认或被覆盖）
+                                            try:
+                                                inflight.discard((x, y))
+                                            except Exception:
+                                                pass
                                         # 同步到 GUI（实时画板预览）
                                         if gui_state is not None:
                                             try:
@@ -769,10 +840,18 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                                     gui_state['board_state'][(x, y)] = (r, g, b)
                                             except Exception:
                                                 pass
-                                        # 清理过期的 pending_paints
+                                        # 清理过期的 pending_paints，并同步 inflight 集合以允许重试
                                         try:
                                             now = time.monotonic()
                                             pending_paints[:] = [p for p in pending_paints if now - p['time'] <= PENDING_TIMEOUT]
+                                            try:
+                                                # 将 inflight 与仍在 pending_paints 中的位置做交集，
+                                                # 这样超时未确认的 pos 会从 inflight 中移除并在后续调度中被重试。
+                                                pending_positions = set(p['pos'] for p in pending_paints)
+                                                inflight.intersection_update(pending_positions)
+                                            except Exception:
+                                                # 如果同步失败也不要阻塞主流程
+                                                pass
                                         except Exception:
                                             pass
                                     except Exception:
@@ -974,6 +1053,10 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             cooldown_until = {u['uid']: 0.0 for u in users_with_tokens}  # monotonic 时间戳
             in_watch_mode = False
             round_idx = 0
+            # 【性能优化】使用 deque 作为剩余任务队列以获得 O(1) 的 popleft
+            from collections import deque as _deque
+            remaining = _deque()
+            last_remaining_update = 0.0
             # 累计派发计数（按配置索引聚合）
             from collections import defaultdict as _dd
             assigned_counter_per_image = _dd(int)
@@ -1201,6 +1284,86 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     except Exception:
                         logging.exception('处理 GUI 刷新请求时出错')
 
+                # 若后台视频帧已更新，重新构建目标映射以反映新帧（注入的视频作为虚拟图片由 tool.VIDEO_STATE 管理）
+                try:
+                    if getattr(tool, 'VIDEO_FRAME_UPDATED', False):
+                        tool.VIDEO_FRAME_UPDATED = False
+                        _res2 = tool.merge_target_maps(images_data)
+                        if isinstance(_res2, tuple) and len(_res2) == 3:
+                            target_map, positions_by_mode, pos_to_image_idx = _res2
+                        else:
+                            target_map, positions_by_mode = _res2
+                            pos_to_image_idx = {}
+                        # rebuild merged positions list and per-image grouping
+                        target_positions = []
+                        for mode in ['horizontal', 'concentric', 'random']:
+                            if mode in positions_by_mode:
+                                target_positions.extend(positions_by_mode[mode])
+                        from collections import defaultdict, deque as _deque
+                        positions_by_image = defaultdict(list)
+                        for pos in target_positions:
+                            idx = pos_to_image_idx.get(pos)
+                            if idx is not None:
+                                positions_by_image[idx].append(pos)
+                        positions_by_image = {k: _deque(v) for k, v in positions_by_image.items()}
+                        # reset remaining queue so scheduler will consider new targets immediately
+                        remaining = _deque([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
+                        last_remaining_update = time.monotonic()
+                        logging.debug('检测到视频帧更新，已重建目标映射以反映新帧')
+                except Exception:
+                    logging.exception('处理视频帧更新时出错')
+
+                # 如果存在虚拟视频图片，检查当前视频帧是否已全部绘制完成，完成后推进到下一帧（不再使用 CRT 隔行）
+                try:
+                    # 遍历 images_data 查找 type=='video' 的虚拟图片
+                    for img in images_data:
+                        if str(img.get('type', '')).lower() != 'video':
+                            continue
+                        folder = img.get('folder') or img.get('image_path')
+                        if not folder:
+                            continue
+                        vs = tool.VIDEO_STATE.get(folder)
+                        if not vs:
+                            continue
+                        cfg_idx = img.get('config_index')
+                        if cfg_idx is None:
+                            continue
+                        # 收集属于此视频虚拟图片的所有目标坐标
+                        video_positions = [pos for pos, idx in pos_to_image_idx.items() if idx == cfg_idx]
+                        if not video_positions:
+                            continue
+                        # 计算已达成的像素比例，达到配置的 complete_rate 即可推进
+                        try:
+                            matched = 0
+                            for p in video_positions:
+                                if board_state.get(p) == target_map.get(p):
+                                    matched += 1
+                            total = len(video_positions)
+                            ratio = (matched / total) if total > 0 else 0.0
+                            threshold = float(vs.get('complete_rate', 1.0))
+                        except Exception:
+                            matched = 0
+                            total = len(video_positions)
+                            ratio = 0.0
+                            threshold = float(vs.get('complete_rate', 1.0))
+
+                        logging.debug(f"视频完成率: {matched}/{total} = {ratio:.2%}, 阈值 {threshold:.2%} (folder={folder})")
+
+                        if ratio >= threshold:
+                            # 若配置为非循环且已到最后一帧，则不再推进
+                            if not bool(vs.get('loop', True)) and int(vs.get('frame', 1)) >= int(vs.get('frame_count', 1)):
+                                logging.info(f"视频已完成最后一帧: folder={folder} frame={vs.get('frame')}")
+                                continue
+                            # 推进到下一帧（1-based）
+                            cur = int(vs.get('frame', 1))
+                            cur = (cur % int(vs.get('frame_count', 1))) + 1
+                            vs['frame'] = cur
+                            tool.VIDEO_FRAME_UPDATED = True
+                            logging.info(f"视频完成率达到阈值，推进到下一帧: folder={folder} frame={cur} (达成 {ratio:.2%})")
+                            # 发现并推进一个视频后可继续检查下一个（若有多个视频）
+                except Exception:
+                    logging.exception('视频完成检测时出错')
+
                 # 若 GUI 模式要求停止，退出循环
                 if gui_state is not None and gui_state.get('stop'):
                     logging.info('收到 GUI 退出信号，结束主循环。')
@@ -1211,63 +1374,63 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     break
                 now = time.monotonic()
                 # 未达目标色（未知状态也视为未完成）
-                remaining = [pos for pos in target_positions if board_state.get(pos) != target_map[pos]]
+                # 使用 deque 保存 remaining（未达到目标的绝对坐标），并在周期性更新时重建队列。
+                # 同时跳过已经在 inflight 中的坐标以避免重复分配。
+                if last_remaining_update == 0.0:
+                    remaining = _deque([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
+                    last_remaining_update = now
+                else:
+                    # 每10轮或每秒更新一次 remaining，其他时候使用缓存队列
+                    if round_idx % 10 == 0 or (now - last_remaining_update) > 1.0:
+                        remaining = _deque([pos for pos in target_positions if board_state.get(pos) != target_map[pos] and pos not in inflight])
+                        last_remaining_update = now
+                    else:
+                        # 否则保留现有 remaining 队列（会在 popleft 时跳过已满足的位置）
+                        pass
 
                 # 可用用户（不在冷却期）
                 available_users = [u for u in users_with_tokens if cooldown_until.get(u['uid'], 0.0) <= now]
 
                 assigned = 0
                 if remaining and available_users:
-                    # 公平派发：按照图片轮转，从各图片的队列取下一个未达标像素
-                    # 若无法建立图片队列，则回退到全局顺序
-                    # 先构建本轮的按图片剩余队列
-                    rem_by_img = {}
-                    if remaining:
-                        tmp = {}
-                        for pos in remaining:
-                            i2 = pos_to_image_idx.get(pos)
-                            if i2 is None:
-                                continue
-                            lst = tmp.setdefault(i2, [])
-                            lst.append(pos)
-                        from collections import deque as __dq
-                        rem_by_img = {k: __dq(v) for k, v in tmp.items()}
-
+                    # 【性能优化】使用更高效的派发策略，避免每轮都重建复杂的字典结构
+                    # 简化版本：直接从 remaining 列表中按轮转策略取出像素分配给用户
+                    
                     for user in available_users:
                         if not remaining:
                             break
+                        # 从队列头部取出一个尚未满足且不在 inflight 的位置（跳过已被外部更新的或正在处理的）
                         pick = None
-                        picked_img_idx = None
-                        if rr_images and rem_by_img:
-                            tried = 0
-                            while tried < len(rr_images):
-                                img_idx = rr_images[rr_cursor % len(rr_images)]
-                                q = rem_by_img.get(img_idx)
-                                if q and len(q) > 0:
-                                    pick = q.popleft()
-                                    picked_img_idx = img_idx
-                                    rr_cursor = (rr_cursor + 1) % max(1, len(rr_images))
-                                    # 从全局 remaining 中移除此点
-                                    try:
-                                        remaining.remove(pick)
-                                    except ValueError:
-                                        pass
-                                    break
-                                else:
-                                    rr_cursor = (rr_cursor + 1) % max(1, len(rr_images))
-                                    tried += 1
+                        while remaining:
+                            cand = remaining.popleft()
+                            # 如果此位置已达到目标颜色，跳过
+                            if board_state.get(cand) == target_map.get(cand):
+                                continue
+                            # 如果已在 inflight，则跳过以避免重复分配
+                            if cand in inflight:
+                                continue
+                            pick = cand
+                            break
                         if pick is None:
-                            pick = remaining.pop(0)
-                            picked_img_idx = pos_to_image_idx.get(pick)
+                            break
                         x, y = pick
                         r, g, b = target_map[(x, y)]
                         uid = user['uid']
-                        token = user['token']
+                        token_bytes = user.get('token_bytes')
+                        uid_bytes3 = user.get('uid_bytes3')
                         paint_id = user_counters[uid]
-                        await tool.paint(ws, uid, token, r, g, b, x, y, paint_id)
+                        # 标记为 in-flight，避免重复分配
+                        inflight.add(pick)
+                        # 调用同步的 paint 函数以避免每次分配产生 await/上下文切换开销
+                        tool.paint(ws, uid, token_bytes, uid_bytes3, r, g, b, x, y, paint_id)
+                        try:
+                            # 唤醒发送任务，尽快把新加入的绘画数据写出（事件驱动替代频繁 sleep）
+                            paint_queue_event.set()
+                        except Exception:
+                            pass
                         # 记录 pending paint，待画板更新广播到来时归属成功绘制
                         try:
-                            image_idx = picked_img_idx if picked_img_idx is not None else pos_to_image_idx.get((x, y)) if 'pos_to_image_idx' in locals() else None
+                            image_idx = pos_to_image_idx.get(pick)
                             pending_paints.append({
                                 'uid': uid,
                                 'paint_id': paint_id,
@@ -1282,15 +1445,23 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         except Exception as e:
                             log_to_web_if_available(gui_state, f"记录pending paint时出错: {e}")
 
-                        logging.info(f"UID {uid} 播报绘制像素: ({x},{y}) color=({r},{g},{b}) id={paint_id}")
+                        # 【性能优化】在高速模式下减少日志输出，仅在 DEBUG 级别或每100次输出一次
+                        if debug or (paint_id % 100 == 0):
+                            logging.info(f"UID {uid} 播报绘制像素: ({x},{y}) color=({r},{g},{b}) id={paint_id}")
+                        else:
+                            logging.debug(f"UID {uid} 绘制: ({x},{y}) id={paint_id}")
                         user_counters[uid] = paint_id + 1
                         cooldown_until[uid] = now + user_cooldown_seconds
                         assigned += 1
 
                     # 输出轮次/进度日志
                     round_idx += 1
-                    left = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
-                    logging.info(f"第 {round_idx} 次调度：分配 {assigned} 个修复任务，剩余未达标 {left}。")
+                    # 【性能优化】避免每轮都重新计算 left，使用估算值或周期性更新
+                    if round_idx % 10 == 0:
+                        left = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
+                        logging.info(f"第 {round_idx} 次调度：分配 {assigned} 个修复任务，剩余未达标 {left}。")
+                    else:
+                        logging.debug(f"第 {round_idx} 次调度：分配 {assigned} 个修复任务。")
 
                 # 计算等待策略
                 if not remaining:
@@ -1320,7 +1491,9 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     # 计算下一个冷却到期或等待上限
                     future_times = [cooldown_until[u['uid']] for u in users_with_tokens if cooldown_until[u['uid']] > now]
                     next_ready_in = min([(t - now) for t in future_times], default=round_interval_seconds)
-                    timeout = max(0.5, min(round_interval_seconds, next_ready_in))
+                    # 之前这里强制最小等待 0.5s 会导致在 cooldown 非常低时（例如 0.05s）出现长时间空转，
+                    # 将最小等待缩短到一个很小的值以提高分配频率（例如 5ms）。
+                    timeout = max(0.005, min(round_interval_seconds, next_ready_in))
                     try:
                         await asyncio.wait_for(state_changed_event.wait(), timeout=timeout)
                     except asyncio.TimeoutError:
@@ -1330,7 +1503,13 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     continue
 
                 # 有分配则短暂让出控制权（粘包发送会在后台周期触发）
-                await asyncio.sleep(0.1)
+                # 为避免每轮都阻塞 100ms（过长），改为短暂让出（例如 5ms 或根据 round_interval_seconds 缩放）
+                # 尽量缩小短等待，使用 asyncio.sleep(0) 作最小的让步以降低空转开销
+                sleep_dur = min(0.001, round_interval_seconds)
+                if sleep_dur <= 0:
+                    await asyncio.sleep(0)
+                else:
+                    await asyncio.sleep(sleep_dur)
 
             # 调度循环因检测到连接问题而退出，直接返回以便 run_forever 重连
             logging.info("调度循环退出，准备重连...")
@@ -1380,6 +1559,20 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             # 不等待队列清空，直接返回让 run_forever 重连
             # 队列中的数据会在下次连接时重新发送
             logging.info("后台任务已清理，准备关闭连接。")
+            # 取消并等待所有写连接任务退出
+            try:
+                for t in write_worker_tasks:
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+                if write_worker_tasks:
+                    try:
+                        await asyncio.gather(*write_worker_tasks, return_exceptions=True)
+                    except Exception:
+                        pass
+            except Exception:
+                logging.debug('取消写连接任务时出错')
     finally:
         # 恢复之前的环境变量（如果有）
         if _saved_env:
@@ -1467,9 +1660,32 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
                     new_tokens = await loop.run_in_executor(None, fetch_tokens_sync)
                     if new_tokens:
                         try:
-                            users_with_tokens.clear()
-                            users_with_tokens.extend(new_tokens)
-                            logging.info(f"已刷新 {len(new_tokens)} 个用户的 token。")
+                            # 预计算 token_bytes 与 uid_bytes3 后再更新 users_with_tokens
+                            validated_new = []
+                            for u in new_tokens:
+                                token = u.get('token')
+                                uid = u.get('uid')
+                                try:
+                                    try:
+                                        token_bytes = UUID(token).bytes
+                                    except Exception:
+                                        token_bytes = UUID(hex=token.replace('-', '')).bytes
+                                except Exception:
+                                    logging.warning(f"刷新后预计算 token_bytes 失败，跳过 uid={uid}")
+                                    continue
+                                try:
+                                    uid_bytes3 = int(uid).to_bytes(3, 'little', signed=False)
+                                except Exception:
+                                    logging.warning(f"刷新后预计算 uid_bytes 失败，跳过 uid={uid}")
+                                    continue
+                                validated_new.append({'uid': uid, 'token': token, 'token_bytes': token_bytes, 'uid_bytes3': uid_bytes3})
+
+                            if validated_new:
+                                users_with_tokens.clear()
+                                users_with_tokens.extend(validated_new)
+                                logging.info(f"已刷新 {len(validated_new)} 个用户的 token。")
+                            else:
+                                logging.warning('刷新 token 后未能预计算到任何有效 token，保留原有 tokens。')
                         except Exception:
                             logging.exception('更新 users_with_tokens 时出错')
                     else:
@@ -1680,10 +1896,11 @@ def main(args):
 
     # 加载所有图片
     images_data = tool.load_all_images(config)
-    if not images_data:
-        logging.error("没有可用的图片配置，程序退出。")
-        return
-
+    
+ ##   if not images_data:
+ ##       logging.error("没有可用的图片配置，程序退出。")
+ ##       return
+    ##
     # 获取 token 阶段：在 GUI 模式下显示进度条避免无响应感
     def get_tokens_with_progress(users_list, allow_gui=True):
         results = []
@@ -1737,6 +1954,90 @@ def main(args):
         return results
 
     users_with_tokens = get_tokens_with_progress(config.get('users', []), allow_gui=True)
+
+    # 预计算 token_bytes 与 uid_bytes3，移除无效 token 的用户，减少后续开销
+    validated = []
+    for u in users_with_tokens:
+        token = u.get('token')
+        uid = u.get('uid')
+        try:
+            try:
+                token_bytes = UUID(token).bytes
+            except Exception:
+                token_bytes = UUID(hex=token.replace('-', '')).bytes
+        except Exception:
+            logging.warning(f"预计算 token_bytes 失败，跳过 uid={uid}")
+            continue
+        try:
+            uid_bytes3 = int(uid).to_bytes(3, 'little', signed=False)
+        except Exception:
+            logging.warning(f"预计算 uid_bytes 失败，跳过 uid={uid}")
+            continue
+        validated.append({'uid': uid, 'token': token, 'token_bytes': token_bytes, 'uid_bytes3': uid_bytes3})
+    users_with_tokens = validated
+
+    # --- 将 video 注入 images_data 作为高权重虚拟图片（动态帧由 tool.VIDEO_STATE 管理） ---
+    try:
+        video_cfg = config.get('video') if isinstance(config, dict) else None
+        if isinstance(video_cfg, dict) and video_cfg.get('enabled', False):
+            folder = video_cfg.get('folder') or video_cfg.get('folder_path') or video_cfg.get('path')
+            if folder:
+                # 收集帧文件（按文件名中第一个数字排序）
+                try:
+                    files = [fn for fn in os.listdir(folder) if fn.lower().endswith(('.png', '.jpg', '.jpeg'))]
+                except Exception:
+                    files = []
+                def _numkey(n):
+                    m = re.search(r"(\d+)", n)
+                    return int(m.group(1)) if m else float('inf')
+                files.sort(key=_numkey)
+                full_paths = [os.path.join(folder, f) for f in files]
+                if full_paths:
+                    fps_val = float(video_cfg.get('fps', 12.0))
+                    # 注册 VIDEO_STATE，使用 folder 作为 key
+                    try:
+                        complete_rate = float(video_cfg.get('complete_rate', video_cfg.get('completion_rate', 1.0)))
+                    except Exception:
+                        complete_rate = 1.0
+                    # clamp to [0,1]
+                    complete_rate = max(0.0, min(1.0, complete_rate))
+                    tool.VIDEO_STATE[folder] = {
+                        'folder': folder,
+                        'files': full_paths,
+                        'frame': 1,
+                        'frame_count': len(full_paths),
+                        'fps': fps_val,
+                        'loop': bool(video_cfg.get('loop', True)),
+                        'complete_rate': complete_rate
+                    }
+                    tool.VIDEO_FRAME_UPDATED = True
+
+                    # 插入为虚拟图片，权重设为很大以确保优先
+                    try:
+                        max_cfg_idx = max((img.get('config_index', i) for i, img in enumerate(images_data)), default=-1)
+                    except Exception:
+                        max_cfg_idx = len(images_data)
+                    vid_cfg_idx = int(max_cfg_idx) + 1
+                    # 强制使用随机绘制顺序以均匀分散派发，避免局部队列卡住导致帧推进延迟
+                    images_data.append({
+                        'type': 'video',
+                        'folder': folder,
+                        'start_x': int(video_cfg.get('start_x', video_cfg.get('startx', 0))),
+                        'start_y': int(video_cfg.get('start_y', video_cfg.get('starty', 0))),
+                        'draw_mode': 'random',
+                        'weight': float(video_cfg.get('weight', 1000000.0)),
+                        'enabled': True,
+                        'config_index': vid_cfg_idx
+                    })
+                    logging.info(f"已把视频注入为虚拟图片: folder={folder} frames={len(full_paths)} fps={fps_val}")
+
+                    # 视频的帧推进现在由主调度逻辑控制（仅在上一帧全部画完后推进），因此不再启动独立的更新时间线程。
+                else:
+                    logging.warning(f"视频目录中没有找到帧文件: {folder}")
+            else:
+                logging.warning('video 配置缺少 folder 字段')
+    except Exception:
+        logging.exception("初始化视频注入时出错")
 
     # 移除 WebUI 后：如果没有可用 token 直接退出，避免尝试启动前端
     if not users_with_tokens:
@@ -1799,7 +2100,98 @@ def main(args):
             t = threading.Thread(target=_auto_restart_worker, args=(auto_minutes, restart_stop_event), daemon=True, name='AutoRestartThread')
             t.start()
 
-        asyncio.run(run_forever(config, users_with_tokens, images_data, debug))
+        # 支持多线程/多进程 worker：按配置将 users_with_tokens 划分到多个 worker 中，
+        # 每个 worker 维护独立的 asyncio 事件循环并运行完整的 run_forever，以提高并发发送吞吐量。
+        thread_workers = 1
+        process_workers = 0
+        try:
+            thread_workers = int(config.get('thread_workers', 1)) if isinstance(config, dict) else 1
+        except Exception:
+            thread_workers = 1
+        try:
+            process_workers = int(config.get('process_workers', 0)) if isinstance(config, dict) else 0
+        except Exception:
+            process_workers = 0
+
+        thread_workers = max(1, min(32, thread_workers))
+        process_workers = max(0, min(16, process_workers))
+
+        # 优先使用进程模式（可真正利用多核），否则使用线程模式
+        if process_workers > 0:
+            # 将 users_with_tokens 轮询分配到 N 个分片，保证尽量均衡
+            def partition_round_robin(items, parts):
+                groups = [[] for _ in range(parts)]
+                for i, it in enumerate(items):
+                    groups[i % parts].append(it)
+                return [g for g in groups if g]
+
+            groups = partition_round_robin(users_with_tokens, process_workers)
+
+            procs = []
+            try:
+                for i, grp in enumerate(groups):
+                    p = multiprocessing.Process(target=process_worker, args=(i, config, grp, images_data, debug), daemon=False)
+                    p.start()
+                    procs.append(p)
+
+                # 主进程等待所有 worker 进程结束（通常只有在用户停止或异常退出时）
+                try:
+                    for p in procs:
+                        p.join()
+                except KeyboardInterrupt:
+                    logging.info('收到 KeyboardInterrupt，等待子进程退出...')
+            finally:
+                # 尝试优雅终止子进程
+                for p in procs:
+                    try:
+                        if p.is_alive():
+                            p.terminate()
+                    except Exception:
+                        pass
+
+        elif thread_workers == 1:
+            asyncio.run(run_forever(config, users_with_tokens, images_data, debug))
+        else:
+            # 将 users_with_tokens 轮询分配到 N 个分片，保证尽量均衡
+            def partition_round_robin(items, parts):
+                groups = [[] for _ in range(parts)]
+                for i, it in enumerate(items):
+                    groups[i % parts].append(it)
+                return [g for g in groups if g]
+
+            groups = partition_round_robin(users_with_tokens, thread_workers)
+
+            import threading as _threading
+            import asyncio as _asyncio
+
+            threads = []
+
+            def _worker_thread(idx, cfg, users_sub, images_sub, dbg):
+                """每个线程创建独立的 asyncio loop 并运行 run_forever"""
+                try:
+                    loop = _asyncio.new_event_loop()
+                    _asyncio.set_event_loop(loop)
+                    loop.run_until_complete(run_forever(cfg, users_sub, images_sub, dbg))
+                except Exception:
+                    import logging as _logging
+                    _logging.exception(f"线程 worker #{idx} 出现未处理异常")
+                finally:
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
+
+            for i, grp in enumerate(groups):
+                t = _threading.Thread(target=_worker_thread, args=(i, config, grp, images_data, debug), daemon=False, name=f"WSWorker-{i}")
+                t.start()
+                threads.append(t)
+
+            # 主线程等待所有 worker 线程结束（通常只有在用户停止或异常退出时）
+            try:
+                for t in threads:
+                    t.join()
+            except KeyboardInterrupt:
+                logging.info('收到 KeyboardInterrupt，等待子线程退出...')
     except Exception as e:
         # 捕获顶层未处理异常，记录日志并尝试优雅停止后台任务
         logging.exception(f"主程序发生未处理异常: {e}")
