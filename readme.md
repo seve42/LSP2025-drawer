@@ -177,38 +177,17 @@ python main.py -test
 }
 ```
 
-### 性能优化
-
-  **多线程模式**（默认）：适合 I/O 密集型任务
-   ```json
-   {"multi_process": false, "max_workers": 8}
-   ```
 
 ## 日志与监控
 
-- `paint.log` - 主程序日志
 - `last.log` - 最近一次运行日志
-- `test_ping.log` - 网络测试日志
 
-## 常见问题
-
-### Token 无效
-
-确保 `access_key` 配置正确，Token 会自动刷新。
-
-### 绘制速度慢
-
-1. 增加 `max_workers` 数量
-2. 使用多账号并发
-3. 选择合适的绘制模式
-
-### 像素被覆盖
-
-使用 `strict` 扫描模式以优先重试被覆盖的像素。
 
 
 ## 许可证
 
 All Rights Reserved (保留所有权利)
+
+禁止修改，再分发
 
 本项目仅供学习交流使用.
