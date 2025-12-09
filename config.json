@@ -1,0 +1,40 @@
+{
+    "users": [
+        {
+            "uid": 114514,
+            "access_key": "example"
+        }
+    ],
+    "writeonly_connections": 5,
+    "paint_interval_ms": 5,
+    "round_interval_seconds": 0,
+    "user_cooldown_seconds": 0.05,
+    "auto_restart_minutes": 100000000,
+    "pixels_per_user_per_round": 20,
+    "max_enabled_tokens": 0,
+    "log_level": "INFO",
+    "images": [
+        {
+            "image_path": "a.png",
+            "start_x": 0,
+            "start_y": 0,
+            "draw_mode": "random",
+            "scan_mode": "normal",
+            "weight": 8.0,
+            "enabled": true,
+            "width": 0,
+            "height": 0
+        },
+        {
+            "image_path": "b.jpg",
+            "start_x": 423,
+            "start_y": 293,
+            "draw_mode": "horizontal",
+            "scan_mode": "struct",
+            "weight": 8.0,
+            "enabled": false,
+            "width": 33,
+            "height": 28
+        }
+    ]
+}
