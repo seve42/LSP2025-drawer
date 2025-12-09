@@ -12,19 +12,19 @@
 
 定义：
 - N_m = 我方 token 数
-- N_e = 敌方 token 数
+- N_e = 对方 token 数
 - η_m = 我方效率（实际有效绘制 / 理论最大），从测试中直接测得
-- η_e = 敌方效率（需要估算）
+- η_e = 对方效率（需要估算）
 - p = 稳态时我方占据率（0~1）
 - CD = 冷却时间（秒）
 
 有效绘制速率：
 - 我方有效速率 R_m = N_m * η_m / CD (px/s)
-- 敌方有效速率 R_e = N_e * η_e / CD (px/s)
+- 对方有效速率 R_e = N_e * η_e / CD (px/s)
 
 二、稳态平衡条件
 ---------------
-稳态时，我方覆盖敌方像素的速率 = 敌方覆盖我方像素的速率：
+稳态时，我方覆盖对方像素的速率 = 对方覆盖我方像素的速率：
 
   R_m * (1-p) = R_e * p
   
@@ -37,10 +37,10 @@
 我方效率 η_m 可直接从测试数据计算：
   η_m = 实际速度 / 理论速度 = (成功像素数/时间) / (token数/CD)
 
-敌方效率 η_e 的估算策略：
+对方效率 η_e 的估算策略：
 1. 智能修复策略（只修错误像素）：η_e ≈ η_m（与我方相当）
-2. 全图扫描策略：η_e ≈ η_m * (重叠面积 / 敌方图片面积)
-3. 保守估计：假设敌方效率是我方的 50%~150%
+2. 全图扫描策略：η_e ≈ η_m * (重叠面积 / 对方图片面积)
+3. 保守估计：假设对方效率是我方的 50%~150%
 
 四、多次测量法（推荐）
 --------------------
@@ -296,7 +296,7 @@ def calculate_matching_pixels(board, target_map):
 
 
 def calculate_enemy_tokens(p_me, user_cd, num_my_tokens, enemy_area, overlap_area, my_efficiency=1.0):
-    """根据稳态完成率计算敌方token数（修正版）
+    """根据稳态完成率计算对方token数（修正版）
     
     修正后的公式考虑效率因子：
     
@@ -307,8 +307,8 @@ def calculate_enemy_tokens(p_me, user_cd, num_my_tokens, enemy_area, overlap_are
       N_m = 我方 token 数
       η_m = 我方效率（从测试中测得）
       p = 我方稳态占据率
-      N_e = 敌方 token 数（待求）
-      η_e = 敌方效率（需假设）
+      N_e = 对方 token 数（待求）
+      η_e = 对方效率（需假设）
     
     解得：
       N_e = N_m * η_m * (1 - p) / (η_e * p)
@@ -323,32 +323,32 @@ def calculate_enemy_tokens(p_me, user_cd, num_my_tokens, enemy_area, overlap_are
     
     Returns:
         dict: {
-            'effective_rate': 敌方有效覆盖速率 (N_e * η_e),
-            'n_same_efficiency': 假设敌方效率与我方相同时的 token 数,
-            'n_high_efficiency': 假设敌方效率为100%时的 token 数,
-            'n_low_efficiency': 假设敌方效率为50%时的 token 数,
-            'n_scan_strategy': 假设敌方扫描全图策略时的 token 数,
+            'effective_rate': 对方有效覆盖速率 (N_e * η_e),
+            'n_same_efficiency': 假设对方效率与我方相同时的 token 数,
+            'n_high_efficiency': 假设对方效率为100%时的 token 数,
+            'n_low_efficiency': 假设对方效率为50%时的 token 数,
+            'n_scan_strategy': 假设对方扫描全图策略时的 token 数,
         }
     """
     if p_me <= 0.01 or p_me >= 0.99:
         return None
     
-    # 核心计算：敌方的有效覆盖速率 (N_e * η_e)
+    # 核心计算：对方的有效覆盖速率 (N_e * η_e)
     # 从稳态条件：N_m * η_m * (1 - p) = N_e * η_e * p
     # => N_e * η_e = N_m * η_m * (1 - p) / p
     effective_enemy_rate = num_my_tokens * my_efficiency * (1 - p_me) / p_me
     
-    # 场景1: 假设敌方效率与我方相同
+    # 场景1: 假设对方效率与我方相同
     n_same = effective_enemy_rate / my_efficiency if my_efficiency > 0 else effective_enemy_rate
     
-    # 场景2: 假设敌方效率为 100%（理想情况）
+    # 场景2: 假设对方效率为 100%（理想情况）
     n_high = effective_enemy_rate / 1.0
     
-    # 场景3: 假设敌方效率为 50%（较差情况）
+    # 场景3: 假设对方效率为 50%（较差情况）
     n_low = effective_enemy_rate / 0.5
     
-    # 场景4: 敌方扫描全图策略
-    # 敌方只有一部分绘制落在重叠区，有效效率降低
+    # 场景4: 对方扫描全图策略
+    # 对方只有一部分绘制落在重叠区，有效效率降低
     # η_e_effective = η_base * (overlap_area / enemy_area)
     area_ratio = overlap_area / enemy_area if enemy_area > 0 else 1.0
     effective_scan_efficiency = my_efficiency * area_ratio
@@ -868,7 +868,7 @@ async def main_test(config, users_with_tokens):
                 print("  建议: 结果基本可靠，但可考虑延长测量时间以获得更多周期数据")
             elif volatility_pct > 45:
                 print(f"  ❌ 未达稳态 - 波动过大 ({volatility_pct:.1f}%)")
-                print("  原因: 投入 token 数不足，被敌方压制导致完成率剧烈波动")
+                print("  原因: 投入 token 数不足，被对方压制导致完成率剧烈波动")
                 print("  建议: 至少增加 50% 的 token 数量后重新测量")
             else:
                 print(f"  ⚠️ 未达稳态 (超时，波动率: {volatility_pct:.1f}%)")
@@ -877,7 +877,7 @@ async def main_test(config, users_with_tokens):
         print(f"  完成率 p: {p_me * 100:.2f}%")
     print("=" * 40)
     
-    # 计算敌方token数
+    # 计算对方token数
     if p_me <= 0.01:
         print("\n完成率过低，测量失败")
         return
@@ -913,7 +913,7 @@ async def main_test(config, users_with_tokens):
         elif volatility_pct > 45:
             print("\n❌ 警告: 系统未达稳态 - 波动过大，估算结果不可靠!")
             print(f"   波动率: {volatility_pct:.1f}% (阈值: 45%)")
-            print("   原因: 投入 token 数量不足，被敌方压制")
+            print("   原因: 投入 token 数量不足，被对方压制")
             print("   结果: 完成率过低导致公式产生严重高估")
             print("   建议: 增加 token 数量使完成率达到 40%~60% 再测量\n")
         else:
@@ -925,13 +925,13 @@ async def main_test(config, users_with_tokens):
     print(f"  N_m = {num_tokens} (我方token数)")
     print(f"  η_m = {my_efficiency:.3f} (我方效率)")
     print(f"  p = {p_me:.3f} (我方占据率)")
-    print(f"  => N_e * η_e = {enemy_result['effective_rate']:.1f} (敌方有效覆盖速率)")
+    print(f"  => N_e * η_e = {enemy_result['effective_rate']:.1f} (对方有效覆盖速率)")
     
-    print(f"\n敌方 token 数估算 (取决于敌方效率假设):")
-    print(f"  若敌方效率 = 100%: 约 {int(round(enemy_result['n_high_efficiency']))} 个 token")
-    print(f"  若敌方效率 = {my_efficiency*100:.0f}% (与我方相同): 约 {int(round(enemy_result['n_same_efficiency']))} 个 token")
-    print(f"  若敌方效率 = 50%: 约 {int(round(enemy_result['n_low_efficiency']))} 个 token")
-    print(f"  若敌方扫描全图 (100×100): 约 {int(round(enemy_result['n_scan_strategy']))} 个 token")
+    print(f"\n对方 token 数估算 (取决于对方效率假设):")
+    print(f"  若对方效率 = 100%: 约 {int(round(enemy_result['n_high_efficiency']))} 个 token")
+    print(f"  若对方效率 = {my_efficiency*100:.0f}% (与我方相同): 约 {int(round(enemy_result['n_same_efficiency']))} 个 token")
+    print(f"  若对方效率 = 50%: 约 {int(round(enemy_result['n_low_efficiency']))} 个 token")
+    print(f"  若对方扫描全图 (100×100): 约 {int(round(enemy_result['n_scan_strategy']))} 个 token")
     
     # 给出综合建议
     print(f"\n📊 综合评估:")
@@ -940,19 +940,19 @@ async def main_test(config, users_with_tokens):
     likely_enemy = int(round(enemy_result['n_same_efficiency']))
     
     if steady_state_reached:
-        print(f"  敌方 token 数范围: {min_enemy} ~ {max_enemy}")
+        print(f"  对方 token 数范围: {min_enemy} ~ {max_enemy}")
         print(f"  最可能值: 约 {likely_enemy} 个")
     elif volatility_pct > 15 and volatility_pct <= 45:
         # 周期性波动，结果基本可靠
-        print(f"  敌方 token 数范围: {min_enemy} ~ {max_enemy} (基于周期平均)")
+        print(f"  对方 token 数范围: {min_enemy} ~ {max_enemy} (基于周期平均)")
         print(f"  最可能值: 约 {likely_enemy} 个")
         print(f"  可信度: 中等（周期性波动，建议延长测量时间验证）")
     elif volatility_pct > 45:
         # 波动过大时，数据不可信
-        print(f"  敌方 token 数: ⚠️ 数据不可信 (波动过大)")
+        print(f"  对方 token 数: ⚠️ 数据不可信 (波动过大)")
         print(f"  以上估算值严重虚高，请增加 token 后重新测量")
     else:
-        print(f"  敌方 token 数: 估算不可靠 (未达稳态)")
+        print(f"  对方 token 数: 估算不可靠 (未达稳态)")
         print(f"  参考范围: >{min_enemy} 个 (下限)")
     
     # 推荐投入量
