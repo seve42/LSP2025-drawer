@@ -5,23 +5,31 @@ import requests
 import json
 import time
 import random
+import struct
 from uuid import UUID
 from PIL import Image
 import asyncio
 import websockets
+from collections import deque
+
+# --- 日志记录到 last.log ---
+LAST_LOG_FILE = "last.log"
+
+def log_last(level: str, message: str):
+    """写入 last.log 的便捷函数"""
+    try:
+        ts = time.strftime('%Y-%m-%d %H:%M:%S')
+        with open(LAST_LOG_FILE, 'a', encoding='utf-8') as f:
+            f.write(f"{ts} - {level.upper()} - [tool] {message}\n")
+    except Exception:
+        pass
 
 # --- 绘画相关工具与队列 ---
 # 【重要】心跳处理已分离到 ping.py 模块，此处仅处理绘画操作
 # 全局粘包队列（供 send_paint_data 与 paint 使用）
-# 注意：粘包队列仅用于绘画操作(0xfe)，不包含心跳包(0xfb/0xfc)
+# 粘包队列仅用于绘画操作(0xfe)，不包含心跳包(0xfb/0xfc)
 paint_queue = []
 total_size = 0
-
-# 视频播放全局状态（用于将视频帧作为动态图片注入调度）
-# 格式示例： { 'video_id_or_folder': { 'folder': 'badapple', 'frame': 1, 'frame_count': 300, 'fps': 12.0 } }
-VIDEO_STATE = {}
-# 当后台更新了视频帧后，将此标志设为 True，调用方（main.handle_websocket）会检测并重新构建目标映射
-VIDEO_FRAME_UPDATED = False
 
 def append_to_queue(paint_data):
     """将绘画数据添加到粘包队列"""
@@ -34,12 +42,10 @@ def get_merged_data():
     global paint_queue, total_size
     if not paint_queue:
         return None
-    merged = bytearray(total_size)
-    offset = 0
-    for chunk in paint_queue:
-        merged[offset:offset + len(chunk)] = chunk
-        offset += len(chunk)
-    paint_queue = []
+    # 优化：使用 join 代替手动切片赋值，大幅提升合并速度
+    merged = b''.join(paint_queue)
+    # 【修复】使用 clear() 代替 = []，避免并发环境下的引用问题
+    paint_queue.clear()
     total_size = 0
     return merged
 
@@ -131,17 +137,16 @@ def paint(ws, uid, token_bytes, uid_bytes3, r, g, b, x, y, paint_id):
     要求传入已预计算的 token_bytes (16 bytes) 与 uid_bytes3 (3 bytes)，以减少开销。
     """
     try:
-        # 构造固定长度的字节包（31 字节），并直接填充切片以降低中间对象分配
-        paint_data = bytearray(31)
-        paint_data[0] = 0xfe
-        paint_data[1:3] = x.to_bytes(2, 'little')
-        paint_data[3:5] = y.to_bytes(2, 'little')
-        paint_data[5:8] = bytes((r, g, b))
-        # uid_bytes3 应为 3 字节的小端表示
-        paint_data[8:11] = uid_bytes3
-        # token_bytes 应为 16 字节
-        paint_data[11:27] = token_bytes
-        paint_data[27:31] = paint_id.to_bytes(4, 'little')
+        # 优化：使用 struct.pack 一次性打包，比 bytearray 切片赋值快且内存分配更高效
+        # < = little-endian
+        # B = uchar (1) -> 0xfe
+        # H = ushort (2) -> x
+        # H = ushort (2) -> y
+        # 3B = 3 uchar -> r, g, b
+        # 3s = 3 bytes -> uid_bytes3
+        # 16s = 16 bytes -> token_bytes
+        # I = uint (4) -> paint_id
+        paint_data = struct.pack('<BHH3B3s16sI', 0xfe, x, y, r, g, b, uid_bytes3, token_bytes, paint_id)
         append_to_queue(paint_data)
     except Exception as e:
         logging.error(f"创建绘画数据时出错: {e}")
@@ -208,10 +213,12 @@ async def send_paint_data(ws, interval_ms, wake_event=None):
                     except (websockets.exceptions.ConnectionClosed, 
                             websockets.exceptions.ConnectionClosedError, 
                             websockets.exceptions.ConnectionClosedOK) as e:
-                        # 连接关闭，过滤掉 Pong 后重新入队数据
-                        # 不退出任务，继续循环（上下文会在连接真正断开时自动取消任务）
+                        # 【关键修复】连接关闭时不退出任务，而是等待一小段时间后继续
+                        # WebSocket 上下文会管理连接生命周期，如果连接真的断开，上下文会取消此任务
+                        # 这样可以避免任务提前退出导致的"僵尸状态"（进度条运行但无法发送）
                         err_msg = str(e) if str(e) else e.__class__.__name__
-                        logging.debug(f"发送时连接关闭: {err_msg}，数据已重新入队")
+                        logging.warning(f"发送时连接关闭: {err_msg}，数据已重新入队，短暂等待后重试")
+                        log_last('ERROR', f"发送时连接关闭: {err_msg}")
                         
                         try:
                             filtered_data = filter_pong_from_data(merged_data)
@@ -221,21 +228,20 @@ async def send_paint_data(ws, interval_ms, wake_event=None):
                                 logging.debug("过滤后没有需要重新入队的数据")
                         except Exception as e2:
                             logging.debug(f"重新入队时出错: {e2}")
-                        # 在发生连接关闭且数据已妥善处理后，主动重启整个脚本以确保绘画任务能恢复
-                        try:
-                            restart_script()
-                        except Exception:
-                            # 如果重启失败，记录但不抛出（任务保持运行，等待上下文取消）
-                            logging.exception("尝试触发进程重启时出错")
+                        
+                        # 短暂等待后继续尝试（而非退出）
+                        await asyncio.sleep(0.1)
                     except asyncio.TimeoutError:
-                        # 发送超时，过滤掉 Pong 后重新入队
-                        logging.debug(f"发送超时，数据已重新入队")
+                        # 发送超时，过滤掉 Pong 后重新入队，继续尝试
+                        logging.warning(f"发送超时，数据已重新入队，继续尝试")
                         try:
                             filtered_data = filter_pong_from_data(merged_data)
                             if filtered_data:
                                 append_to_queue(filtered_data)
                         except Exception as e2:
                             logging.debug(f"重新入队时出错: {e2}")
+                        # 短暂等待后继续
+                        await asyncio.sleep(0.1)
                     except asyncio.CancelledError:
                         # 任务被取消（WebSocket 上下文结束），过滤掉 Pong 后保存数据并退出
                         logging.debug("发送任务被取消")
@@ -250,19 +256,24 @@ async def send_paint_data(ws, interval_ms, wake_event=None):
                         # 其他异常，过滤掉 Pong 后重新入队并继续
                         err_msg = str(e) if str(e) else e.__class__.__name__
                         err_type = e.__class__.__name__
-                        logging.debug(f"发送时出错 ({err_type}): {err_msg}，数据已重新入队")
+                        logging.warning(f"发送时出错 ({err_type}): {err_msg}，数据已重新入队，继续尝试")
+                        log_last('ERROR', f"发送时出错 ({err_type}): {err_msg}")
                         try:
                             filtered_data = filter_pong_from_data(merged_data)
                             if filtered_data:
                                 append_to_queue(filtered_data)
                         except Exception as e2:
                             logging.debug(f"重新入队时出错: {e2}")
+                        # 短暂等待后继续
+                        await asyncio.sleep(0.1)
     except asyncio.CancelledError:
         logging.debug("发送任务被取消（正常退出）")
+        log_last('INFO', "发送任务被取消（正常退出）")
         raise
     except Exception as e:
         err_msg = str(e) if str(e) else e.__class__.__name__
         logging.error(f"发送任务异常退出: {err_msg}")
+        log_last('ERROR', f"发送任务异常退出: {err_msg}")
     finally:
         logging.info("发送任务已退出")
 
@@ -579,28 +590,10 @@ def merge_target_maps(images_data):
         # 单图组直接按原逻辑处理（效率最高）
         if len(group_list) == 1:
             orig_idx, cfg_idx, img_data = group_list[0]
-            # 支持动态视频条目（type == 'video'）：从 VIDEO_STATE 中获取当前帧并加载像素
-            if str(img_data.get('type', '')).lower() == 'video':
-                folder = img_data.get('folder') or img_data.get('image_path')
-                vs = VIDEO_STATE.get(folder)
-                if vs and vs.get('files'):
-                    try:
-                        # frame 存为 1-based
-                        frame_idx = max(0, int(vs.get('frame', 1)) - 1)
-                        frame_path = vs['files'][frame_idx % len(vs['files'])]
-                        img = Image.open(frame_path).convert('RGBA')
-                        width, height = img.size
-                        pixels = list(img.getdata())
-                    except Exception:
-                        logging.exception(f"加载视频帧失败: {folder}")
-                        continue
-                else:
-                    logging.warning(f"视频状态未初始化或无帧: {folder}")
-                    continue
-            else:
-                pixels = img_data['pixels']
-                width = img_data['width']
-                height = img_data['height']
+            # 视频功能已废弃
+            pixels = img_data['pixels']
+            width = img_data['width']
+            height = img_data['height']
             start_x = img_data['start_x']
             start_y = img_data['start_y']
             draw_mode = img_data['draw_mode']
@@ -638,31 +631,10 @@ def merge_target_maps(images_data):
         # 先为每张图片生成其绝对坐标列表（按各自 draw_mode 的顺序）
         per_image_entries = []  # list of dicts: {cfg_idx, draw_mode, abs_coords, target_map}
         for orig_idx, cfg_idx, img_data in group_list:
-            # 支持 video 类型：按当前帧加载像素
-            if str(img_data.get('type', '')).lower() == 'video':
-                folder = img_data.get('folder') or img_data.get('image_path')
-                vs = VIDEO_STATE.get(folder)
-                if vs and vs.get('files'):
-                    try:
-                        frame_idx = max(0, int(vs.get('frame', 1)) - 1)
-                        frame_path = vs['files'][frame_idx % len(vs['files'])]
-                        img = Image.open(frame_path).convert('RGBA')
-                        width, height = img.size
-                        pixels = list(img.getdata())
-                    except Exception:
-                        logging.exception(f"加载视频帧失败: {folder}")
-                        pixels = []
-                        width = 0
-                        height = 0
-                else:
-                    logging.warning(f"视频状态未初始化或无帧: {folder}")
-                    pixels = []
-                    width = 0
-                    height = 0
-            else:
-                pixels = img_data['pixels']
-                width = img_data['width']
-                height = img_data['height']
+            # 视频功能已废弃
+            pixels = img_data['pixels']
+            width = img_data['width']
+            height = img_data['height']
             start_x = img_data['start_x']
             start_y = img_data['start_y']
             draw_mode = img_data['draw_mode']
@@ -689,7 +661,7 @@ def merge_target_maps(images_data):
             per_image_entries.append({
                 'cfg_idx': cfg_idx,
                 'draw_mode': draw_mode,
-                'abs_coords': abs_coords,
+                'abs_coords': deque(abs_coords),
                 'target_map': tmap,
             })
 
@@ -702,7 +674,7 @@ def merge_target_maps(images_data):
                 if not entry['abs_coords']:
                     continue
                 any_left = True
-                abs_pos = entry['abs_coords'].pop(0)
+                abs_pos = entry['abs_coords'].popleft()
                 # 分配到 combined_target_map（若尚未被占用）
                 if abs_pos not in combined_target_map:
                     combined_target_map[abs_pos] = entry['target_map'][abs_pos]

@@ -1,3 +1,38 @@
+"""
+LSP2025-drawer 主程序
+
+运行模式说明：
+1. 默认模式：
+   直接运行 `python main.py`。
+   启动 WebUI (默认端口80)，自动根据 config.json 配置进行绘图。
+   支持多进程/多线程并发绘图。
+
+2. CLI 模式 (`-cli`)：
+   运行 `python main.py -cli`。
+   仅在命令行运行，不启动 WebUI 服务器。
+   适合在无头服务器或不需要 Web 界面时使用。
+
+3. 手动模式 (`-hand`)：
+   运行 `python main.py -hand`。
+   启动手动绘板模式，强制单线程运行。
+   通常用于测试或手动控制绘图。
+
+4. 调试模式 (`-debug`)：
+   运行 `python main.py -debug`。
+   启用详细日志输出 (DEBUG 级别)，方便排查问题。
+   可与其他模式组合使用，如 `python main.py -cli -debug`。
+
+配置说明：
+1. 绘制模式 (draw_mode):
+   - random: 随机顺序绘制像素（默认）。
+   - horizontal: 逐行扫描绘制（从左到右，从上到下）。
+   - concentric: 从中心向外扩散绘制。
+
+2. 扫描模式 (scan_mode):
+   - normal: 默认模式。绘制失败优先重试，检测到被覆盖放到队尾。
+   - strict: 严格模式。绘制失败或检测到像素被覆盖，均优先重试（插入队首）。
+   - loop: 循环模式。绘制失败或检测到像素被覆盖，均放到队尾重新排队。
+"""
 import argparse
 import asyncio
 import websockets
@@ -12,7 +47,6 @@ from uuid import UUID
 from PIL import Image
 import tool
 import ping
-import seq_player
 import threading
 import re
 from collections import OrderedDict, deque
@@ -26,6 +60,39 @@ from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeRe
 API_BASE_URL = "https://paintboard.luogu.me"
 WS_URL = "wss://paintboard.luogu.me/api/paintboard/ws"
 CONFIG_FILE = "config.json"
+LAST_LOG_FILE = "last.log"
+
+# 清空 last.log 文件（启动时）
+try:
+    with open(LAST_LOG_FILE, 'w', encoding='utf-8') as f:
+        f.write(f"=== LSP2025-drawer 启动于 {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+except Exception:
+    pass
+
+# 创建专用的 last.log 日志记录器
+last_logger = logging.getLogger('last')
+last_logger.setLevel(logging.DEBUG)
+last_handler = logging.FileHandler(LAST_LOG_FILE, encoding='utf-8', mode='a')
+last_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+last_logger.addHandler(last_handler)
+
+def log_last(level: str, message: str):
+    """写入 last.log 的便捷函数，同时也写入主日志"""
+    ts = time.strftime('%Y-%m-%d %H:%M:%S')
+    level_upper = level.upper()
+    try:
+        if level_upper == 'DEBUG':
+            last_logger.debug(message)
+        elif level_upper == 'INFO':
+            last_logger.info(message)
+        elif level_upper == 'WARNING':
+            last_logger.warning(message)
+        elif level_upper == 'ERROR':
+            last_logger.error(message)
+        else:
+            last_logger.info(message)
+    except Exception:
+        pass
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,7 +104,7 @@ logging.basicConfig(
 )
 
 
-def process_worker(idx, cfg, users_sub, images_sub, dbg):
+def process_worker(idx, cfg, users_sub, images_sub, dbg, precomputed_target=None):
     """顶层函数：在子进程中启动独立的 asyncio 事件循环并运行 run_forever。
 
     该函数需要位于模块顶层以便 multiprocessing 在 Windows 上能够正确导入并调用。
@@ -47,7 +114,7 @@ def process_worker(idx, cfg, users_sub, images_sub, dbg):
     try:
         loop = _asyncio.new_event_loop()
         _asyncio.set_event_loop(loop)
-        loop.run_until_complete(run_forever(cfg, users_sub, images_sub, dbg))
+        loop.run_until_complete(run_forever(cfg, users_sub, images_sub, dbg, precomputed_target=precomputed_target))
     except Exception:
         import logging as _logging
         _logging.exception(f"进程 worker #{idx} 出现未处理异常")
@@ -57,8 +124,8 @@ def process_worker(idx, cfg, users_sub, images_sub, dbg):
         except Exception:
             pass
 
-# pending paints waiting for confirmation via board update: list of dicts {uid, paint_id, pos, color, time}
-pending_paints = []
+# pending paints waiting for confirmation via board update: dict {paint_id: {uid, pos, color, time, image_idx}}
+pending_paints = {}
 # per-user snapshot of their most recent successful painted pixels: uid -> OrderedDict[(x,y) -> (r,g,b)]
 user_last_snapshot = {}
 # configuration for snapshot size and pending timeout (seconds)
@@ -89,21 +156,55 @@ def append_to_queue(paint_data):
     paint_queue.append(paint_data)
     total_size += len(paint_data)
 
-def get_merged_data():
-    """合并队列中的所有数据块"""
+def get_merged_data(max_size=32768):
+    """合并队列中的数据块，最多不超过max_size字节
+    
+    优化：
+    1. 限制单次提取大小，避免超过32KB限制
+    2. 保留未发送的数据在队列中
+    3. 以像素为单位（31字节），不拆分单个像素
+    """
     global paint_queue, total_size
     if not paint_queue:
         return None
     
-    merged = bytearray(total_size)
-    offset = 0
-    for chunk in paint_queue:
-        merged[offset:offset + len(chunk)] = chunk
-        offset += len(chunk)
+    # 计算可以发送的数据量，以像素为单位（31字节/像素）
+    max_pixels = max_size // 31
+    actual_size = min(total_size, max_pixels * 31)
     
-    paint_queue = []
-    total_size = 0
-    return merged
+    # 如果数据量很小且不急，等待更多
+    if actual_size < 155 and total_size < max_size // 2:  # 5像素
+        return None
+    
+    merged = bytearray(actual_size)
+    offset = 0
+    extracted_chunks = []
+    
+    while paint_queue and offset < actual_size:
+        chunk = paint_queue[0]
+        chunk_len = len(chunk)
+        
+        if offset + chunk_len <= actual_size:
+            # 完整放入
+            merged[offset:offset + chunk_len] = chunk
+            offset += chunk_len
+            paint_queue.popleft()
+            extracted_chunks.append(chunk)
+        else:
+            # 部分放入（以像素为单位）
+            remaining = actual_size - offset
+            pixels_to_take = remaining // 31
+            bytes_to_take = pixels_to_take * 31
+            
+            if bytes_to_take > 0:
+                merged[offset:offset + bytes_to_take] = chunk[:bytes_to_take]
+                offset += bytes_to_take
+                # 修改原始 chunk，移除已提取部分
+                paint_queue[0] = chunk[bytes_to_take:]
+            break
+    
+    total_size -= offset
+    return merged if offset > 0 else None
 
 async def paint(ws, uid, token, r, g, b, x, y, paint_id):
     """准备绘画数据并加入队列"""
@@ -134,7 +235,10 @@ async def paint(ws, uid, token, r, g, b, x, y, paint_id):
         logging.error(f"创建绘画数据时出错: {e}")
 
 async def send_paint_data(ws, interval_ms):
-    """定时发送粘合后的绘画数据包"""
+    """定时发送粘合后的绘画数据包，支持动态批量和智能粘包"""
+    max_packet_size = 32768  # 32KB 服务器限制
+    last_send_time = time.monotonic()
+    
     while True:
         await asyncio.sleep(interval_ms / 1000.0)
         # websockets 新旧 API 兼容：优先使用 ws.open，否则使用 not ws.closed
@@ -146,13 +250,22 @@ async def send_paint_data(ws, interval_ms):
             is_open = False
 
         if is_open and paint_queue:
-            merged_data = get_merged_data()
+            merged_data = get_merged_data(max_size=max_packet_size)
             if merged_data:
+                data_size = len(merged_data)
+                pixel_count = data_size // 31  # 每个像素31字节
+                
                 try:
                     await ws.send(merged_data)
-                    logging.debug(f"已发送 {len(merged_data)} 字节的绘画数据（粘包）。")
+                    now = time.monotonic()
+                    actual_interval = (now - last_send_time) * 1000
+                    last_send_time = now
+                    logging.debug(f"发送 {pixel_count}px ({data_size}字节)，间隔{actual_interval:.1f}ms")
                 except websockets.ConnectionClosed:
                     logging.warning("发送数据时 WebSocket 连接已关闭。")
+                    # 连接关闭时数据已经丢失，不放回队列（会在上层重试机制处理）
+                except Exception as e:
+                    logging.warning(f"发送数据时出错: {e}")
                     break
                 except Exception as e:
                     logging.error(f"发送数据时出错: {e}")
@@ -313,6 +426,7 @@ def load_config():
         # 程序自重启间隔（分钟），如果为 0 则禁用自动重启
         cfg.setdefault('auto_restart_minutes', 30)
         cfg.setdefault('user_cooldown_seconds', 30)
+        cfg.setdefault('max_enabled_tokens', 0)  # 最大启用token数，0表示不限制
         cfg.setdefault('users', [])
         
         # 兼容旧配置格式：如果有 image_path 但没有 images，则创建 images 列表
@@ -482,7 +596,7 @@ def get_token(uid: int, access_key: str):
             os.environ.update(_saved_env)
 
 
-async def handle_websocket(config, users_with_tokens, images_data, debug=False, gui_state=None):
+async def handle_websocket(config, users_with_tokens, images_data, debug=False, gui_state=None, precomputed_target=None):
     """主 WebSocket 处理函数
 
     修复点：
@@ -494,9 +608,37 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
     round_interval_seconds = config.get("round_interval_seconds", 30)
     user_cooldown_seconds = config.get("user_cooldown_seconds", 30)
 
+    # 性能优化：根据用户冷却时间和token数量智能调整发送间隔
+    # 目标：在不超过服务器速率限制（256包/秒）的前提下最大化吞吐量
+    num_tokens = len(users_with_tokens)
+    if user_cooldown_seconds < 0.1 and num_tokens > 0:
+        # 极短冷却模式：动态计算最优发送间隔
+        # 理论每秒像素数 = token数量 / 冷却时间
+        theoretical_px_per_sec = num_tokens / user_cooldown_seconds
+        # 服务器限制：256包/秒，即每包间隔约 3.9ms
+        # 目标：每个包包含足够多的像素以减少延迟损失
+        # 最优策略：让每个包包含 冷却时间内可绘制的像素数
+        optimal_pixels_per_packet = max(1, int(num_tokens * paint_interval_ms / 1000.0 / user_cooldown_seconds))
+        # 如果每包像素太少，增加发送间隔以积累更多像素
+        if optimal_pixels_per_packet < 5:
+            # 调整为每包至少5-10个像素，减少网络开销
+            paint_interval_ms = max(5, int(5 * user_cooldown_seconds * 1000.0 / num_tokens))
+            paint_interval_ms = min(paint_interval_ms, 20)  # 不超过20ms以保持响应性
+        else:
+            # 使用接近256包/秒限制的间隔，但留有余量
+            paint_interval_ms = max(4, paint_interval_ms)  # 250包/秒
+        logging.info(f"智能调整：{num_tokens}个token，CD={user_cooldown_seconds*1000:.1f}ms，发送间隔={paint_interval_ms}ms，预期每包{optimal_pixels_per_packet}像素")
+    else:
+        # 正常冷却模式：保持配置的发送间隔或至少 10ms
+        paint_interval_ms = max(10, paint_interval_ms)
+
     # 合并所有图片的目标像素映射（处理重叠，高权重优先）
     # tool.merge_target_maps 现在也返回每个绝对坐标对应的图片索引映射 pos_to_image_idx
-    result = tool.merge_target_maps(images_data)
+    if precomputed_target:
+        result = precomputed_target
+    else:
+        result = tool.merge_target_maps(images_data)
+    
     # 兼容旧接口：如果返回两个值则填充空映射
     if isinstance(result, tuple) and len(result) == 3:
         target_map, positions_by_mode, pos_to_image_idx = result
@@ -518,6 +660,16 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             positions_by_image[idx].append(pos)
     positions_by_image = {k: _deque(v) for k, v in positions_by_image.items()}
     
+    # 构建 image_idx -> scan_mode 映射
+    image_idx_to_scan_mode = {}
+    try:
+        for img in images_data:
+            cfg_idx = img.get('config_index')
+            if cfg_idx is not None:
+                image_idx_to_scan_mode[cfg_idx] = str(img.get('scan_mode', 'normal')).lower()
+    except Exception:
+        pass
+
     logging.info(f"已加载 {len(images_data)} 个图片，合并后共 {len(target_map)} 个目标像素")
 
     # 如果有 GUI 状态对象，初始化一些可视化字段
@@ -583,6 +735,8 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
 
     # 记录本次连接开始时间，供上层决定是否重置退避
     conn_started_at = time.monotonic()
+    # 统计信息：利用率
+    stats = {'sent': 0, 'success': 0}
     try:
         # 限制握手与关闭超时，避免卡住；部分环境下可减轻“opening handshake 超时”的长期滞留
         async with websockets.connect(
@@ -593,7 +747,12 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             close_timeout=10,
             max_size=10 * 1024 * 1024,  # 10MB 消息大小限制
         ) as ws:
+            # 添加连接分隔符到日志（方便区分不同连接会话）
+            log_last('INFO', '=' * 80)
+            log_last('INFO', f"新连接建立于 {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            log_last('INFO', '=' * 80)
             logging.info("WebSocket 连接已建立")
+            log_last('INFO', f"WebSocket 连接已建立 - URL: {WS_URL}")
             # 更新 GUI 状态：已连接
             try:
                 if gui_state is not None:
@@ -634,25 +793,128 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             async def write_only_worker(idx: int):
                 """单独的写连接任务：建立独立 WebSocket 连接并运行 send_paint_data 循环。
 
-                设计目标：分摊发送压力到多个连接，提高并发发送能力。遇到异常时记录并退出（上层会重连）。
+                设计目标：分摊发送压力到多个连接，提高并发发送能力。
+                【重要修复】只写连接仍需响应心跳！服务端会向所有连接发送 Ping，
+                只写连接也必须响应 Pong，否则会被 1001 Ping timeout 断开。
+                
+                解决方案：同时运行心跳接收任务和发送任务。
                 """
+                write_url = WS_URL + "?writeonly=1"
                 try:
                     async with websockets.connect(
-                        WS_URL,
+                        write_url,
                         ping_interval=None,
                         ping_timeout=None,
                         open_timeout=30,
                         close_timeout=10,
                         max_size=10 * 1024 * 1024,
                     ) as write_ws:
-                        logging.info(f"写连接 #{idx} 已建立")
-                        await tool.send_paint_data(write_ws, paint_interval_ms, paint_queue_event)
+                        logging.info(f"写连接 #{idx} 已建立 (writeonly模式)")
+                        log_last('INFO', f"写连接 #{idx} 已建立 (writeonly模式)")
+                        
+                        async def heartbeat_handler():
+                            """处理只写连接的心跳：收到 Ping 立即回复 Pong"""
+                            ping_count = 0
+                            try:
+                                async for message in write_ws:
+                                    try:
+                                        if isinstance(message, str):
+                                            data = bytearray(message.encode())
+                                        else:
+                                            data = bytearray(message)
+                                        offset = 0
+                                        while offset < len(data):
+                                            opcode = data[offset]
+                                            offset += 1
+                                            if opcode == 0xfc:  # Ping
+                                                ping_count += 1
+                                                try:
+                                                    await write_ws.send(bytes([0xfb]))
+                                                    logging.debug(f"写连接 #{idx} 心跳 #{ping_count}: Ping -> Pong")
+                                                except (websockets.exceptions.ConnectionClosed,
+                                                        websockets.exceptions.ConnectionClosedError,
+                                                        websockets.exceptions.ConnectionClosedOK) as e:
+                                                    err_msg = str(e) if str(e) else e.__class__.__name__
+                                                    logging.warning(f"写连接 #{idx} 发送 Pong 失败（连接已关闭）: {err_msg} (总计收到{ping_count}个Ping)")
+                                                    log_last('ERROR', f"写连接 #{idx} Pong失败（连接关闭）: {err_msg} (总计{ping_count}个Ping)")
+                                                    return
+                                                except Exception as e:
+                                                    logging.warning(f"写连接 #{idx} 发送 Pong 失败: {e}")
+                                                    log_last('ERROR', f"写连接 #{idx} 发送 Pong 失败: {e}")
+                                                    return
+                                            elif opcode == 0xff:  # 绘画结果
+                                                offset += 5  # 跳过 paint_id(4) + status(1)
+                                            elif opcode == 0xfa:  # 画板更新
+                                                offset += 7  # 跳过 x(2) + y(2) + r(1) + g(1) + b(1)
+                                            else:
+                                                pass  # 忽略其他消息
+                                    except Exception as e:
+                                        logging.debug(f"写连接 #{idx} 处理消息时出错: {e}")
+                            except asyncio.CancelledError:
+                                raise
+                            except Exception as e:
+                                logging.warning(f"写连接 #{idx} 心跳处理器异常退出: {e}")
+                                log_last('ERROR', f"写连接 #{idx} 心跳处理器异常退出: {e}")
+                        
+                        # 同时运行心跳处理和发送任务
+                        heartbeat_task = asyncio.create_task(heartbeat_handler())
+                        send_task = asyncio.create_task(tool.send_paint_data(write_ws, paint_interval_ms, paint_queue_event))
+                        
+                        try:
+                            # 等待任意一个任务完成（通常是因为连接关闭）
+                            done, pending = await asyncio.wait(
+                                [heartbeat_task, send_task],
+                                return_when=asyncio.FIRST_COMPLETED
+                            )
+                            # 取消剩余任务
+                            for task in pending:
+                                task.cancel()
+                                try:
+                                    await task
+                                except asyncio.CancelledError:
+                                    pass
+                        except asyncio.CancelledError:
+                            heartbeat_task.cancel()
+                            send_task.cancel()
+                            try:
+                                await heartbeat_task
+                            except asyncio.CancelledError:
+                                pass
+                            try:
+                                await send_task
+                            except asyncio.CancelledError:
+                                pass
+                            raise
+                except asyncio.CancelledError:
+                    raise
                 except Exception as e:
                     logging.warning(f"写连接 #{idx} 异常退出: {e}")
+                    log_last('ERROR', f"写连接 #{idx} 异常退出: {e}")
+                    # 短暂等待后将由外层循环重连
+                    await asyncio.sleep(1.0)
+
+            async def write_only_worker_with_reconnect(idx: int):
+                """带自动重连的只写连接任务"""
+                reconnect_count = 0
+                while True:
+                    try:
+                        await write_only_worker(idx)
+                        # 如果正常退出（不太可能），等待后重连
+                        reconnect_count += 1
+                        logging.info(f"写连接 #{idx} 正常退出，准备第 {reconnect_count} 次重连...")
+                        await asyncio.sleep(2.0)
+                    except asyncio.CancelledError:
+                        logging.debug(f"写连接 #{idx} 任务被取消")
+                        raise
+                    except Exception as e:
+                        reconnect_count += 1
+                        logging.warning(f"写连接 #{idx} 异常，准备第 {reconnect_count} 次重连: {e}")
+                        log_last('WARNING', f"写连接 #{idx} 准备第 {reconnect_count} 次重连")
+                        await asyncio.sleep(min(5.0, 1.0 * reconnect_count))  # 指数退避，最多5秒
 
             for i in range(extra_writers):
                 try:
-                    t = asyncio.create_task(write_only_worker(i))
+                    t = asyncio.create_task(write_only_worker_with_reconnect(i))
                     write_worker_tasks.append(t)
                 except Exception:
                     logging.exception(f"启动写连接任务 #{i} 失败")
@@ -678,6 +940,21 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             state_changed_event = asyncio.Event()
             # in-flight 集合：记录已分配但尚未被画板更新确认的位置，避免重复分配
             inflight = set()
+            # recent_success 集合：记录最近收到 0xef 成功响应的坐标，避免短时间内重复绘制
+            # 格式: {pos: expire_time}
+            recent_success = {}
+            
+            # 【连接健康监控】
+            # 跟踪最后一次成功接收服务器消息的时间
+            last_message_time = time.monotonic()
+            # 跟踪最后一次成功接收心跳(Ping)的时间
+            last_ping_received = time.monotonic()
+            # 需要重连的标志（由进度监控器或健康检查设置）
+            need_reconnect = False
+            # 连续零像素增长的秒数（超过阈值触发重连）
+            zero_growth_seconds = 0
+            # 零增长触发重连的阈值（秒）
+            ZERO_GROWTH_RECONNECT_THRESHOLD = 120  # 2分钟无增长则重连
 
             # 启动独立的 Ping 处理进程（通过两个 multiprocessing.Queue 与之通信）
             try:
@@ -695,23 +972,63 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
             # 为兼容后续清理逻辑，创建一个已完成的占位任务（无需实际监控任务）
             heartbeat_monitor_task = asyncio.create_task(asyncio.sleep(0))
             
+            # 初始化待绘队列（供 receiver 增量更新）
+            remaining = _deque()
+
+            # --- 重要：在定义 receiver() 前初始化所有它依赖的状态变量 ---
+            # Token 池：记录每个 Token 的状态（仅记录last_success用于冷却判断）
+            # uid -> {'last_success': 0.0, 'fail_count': 0, 'invalid_count': 0}
+            # fail_count: 连续失败次数（用于退避）
+            # invalid_count: Token 无效错误计数（0xed）
+            token_states = {u['uid']: {'last_success': 0.0, 'fail_count': 0, 'invalid_count': 0} for u in users_with_tokens}
+            
+            # Token 刷新请求队列（uid -> need_refresh）
+            token_refresh_needed = set()
+            
+            # 任务池：记录当前正在进行的绘制任务（仅用于统计和0xff响应匹配）
+            # paint_id -> {'pos': (x,y), 'color': (r,g,b), 'uid': uid, 'time': monotonic_time}
+            active_tasks = {}
+            
+            # 位置锁：记录哪些位置最近被绘制过，避免短时间内重复提交
+            # pos -> expire_timestamp（锁定到此时间戳，之后可以重新绘制）
+            pos_locks = {}
+            
+            # 扫描游标：记录上次扫描到的位置索引，实现循环扫描（Round Robin）
+            scan_cursor = 0
+            
+            # 统计信息（供进度条显示）
+            # 如果 gui_state 已经有 stats，直接使用它（测量模式）
+            # 否则创建新的 stats 并暴露给 gui_state（普通模式）
+            if gui_state is not None and 'stats' in gui_state:
+                stats = gui_state['stats']  # 直接引用，让后续修改生效
+            else:
+                stats = {'sent': 0, 'success': 0}
+                if gui_state is not None:
+                    with gui_state['lock']:
+                        gui_state['stats'] = stats
+
             # 启动接收任务：处理 Ping(0xfc)、绘画结果(0xff)、画板更新(0xfa) 等
             async def receiver():
-                """接收并处理服务器消息，使用独立的 ping.py 模块处理心跳
+                """接收并处理服务器消息
                 
-                改进：
-                - 使用专门的 HeartbeatManager 处理心跳
-                - 更完善的异常捕获和分类处理
-                - 连续错误计数和自动退出
-                - 详细的错误日志
+                【关键修复】简化心跳处理：
+                - 收到 0xfc Ping 时立即直接发送 0xfb Pong，不使用多进程通信
+                - 避免多进程队列延迟导致心跳超时 (1001 Ping timeout)
+                - 更新 last_message_time 和 last_ping_received 供健康检查使用
                 """
-                consecutive_errors = 0
-                max_consecutive_errors = 10
+                nonlocal ping_in_q, ping_out_q, ping_proc, last_message_time, last_ping_received, need_reconnect
+                
+                pong_failures = 0
                 message_count = 0
+                ping_count = 0
+                opcode_stats = {'0xfc': 0, '0xff': 0, '0xfa': 0, 'other': 0}  # 统计各类消息
                 
                 try:
                     async for message in ws:
                         message_count += 1
+                        # 更新最后消息接收时间（用于健康检查）
+                        last_message_time = time.monotonic()
+                        
                         try:
                             if isinstance(message, str):
                                 data = bytearray(message.encode())
@@ -722,142 +1039,139 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                 opcode = data[offset]
                                 offset += 1
                                 if opcode == 0xfc:  # Heartbeat Ping
-                                    # 将 ping 事件转发到独立的 Ping 进程（若可用）
-                                    resp = None
-                                    if 'ping_in_q' in locals() and ping_in_q is not None and ping_out_q is not None:
-                                        try:
-                                            ping_in_q.put({'type': 'ping', 'ts': time.monotonic()})
-                                        except Exception as e:
-                                            logging.warning(f"向 ping 进程发送 ping 事件失败: {e}")
-                                            # 标记不可用，回退到直接发送
-                                            ping_in_q = None
-
-                                        # 尝试短暂等待来自 ping 进程的指令（非阻塞主事件循环）
-                                        try:
-                                            loop = asyncio.get_running_loop()
-                                            resp = await loop.run_in_executor(None, ping_out_q.get, True, 0.05)
-                                        except Exception:
-                                            resp = None
-
-                                    # 处理 ping 进程的响应
-                                    if isinstance(resp, dict) and resp.get('cmd') == 'send_pong':
-                                            try:
-                                                # 记录收到 ping 的时间并在发送后记录响应时延，便于诊断
-                                                t_recv = time.monotonic()
-                                                await ws.send(bytes([0xfb]))
-                                                t_sent = time.monotonic()
-                                                logging.debug(f"心跳: 收到 ping -> 发送 pong, 延迟: {(t_sent - t_recv)*1000:.2f}ms")
-                                                consecutive_errors = 0
-                                            except Exception as e:
-                                                err_msg = str(e) if str(e) else e.__class__.__name__
-                                                logging.warning(f"发送 Pong 时出错: {err_msg}")
-                                                consecutive_errors += 1
-                                                if consecutive_errors >= max_consecutive_errors:
-                                                    logging.error("心跳处理连续失败，接收任务退出。")
-                                                    if 'ping_proc' in locals() and ping_proc is not None:
-                                                        logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)}")
-                                                    return
-                                    elif isinstance(resp, dict) and resp.get('cmd') == 'restart':
-                                        logging.warning("Ping 进程请求重启主进程")
-                                        try:
-                                            tool.restart_script()
-                                        except Exception:
-                                            pass
-                                    else:
-                                        # 回退：立即在当前连接上发送 Pong（保证实时性）
-                                        try:
-                                            t_recv = time.monotonic()
-                                            await ws.send(bytes([0xfb]))
-                                            t_sent = time.monotonic()
-                                            logging.debug(f"心跳(fallback): 收到 ping -> 发送 pong, 延迟: {(t_sent - t_recv)*1000:.2f}ms")
-                                            consecutive_errors = 0
-                                        except Exception as e:
-                                            err_msg = str(e) if str(e) else e.__class__.__name__
-                                            logging.warning(f"发送 Pong (fallback) 时出错: {err_msg}")
-                                            consecutive_errors += 1
-                                            if consecutive_errors >= max_consecutive_errors:
-                                                logging.error("心跳处理连续失败，接收任务退出。")
-                                                if 'ping_proc' in locals() and ping_proc is not None:
-                                                    logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)}")
-                                                return
+                                    opcode_stats['0xfc'] += 1
+                                    # 【关键修复】立即直接发送 Pong，不使用多进程队列
+                                    # 根据文档：收到 Ping 后应立即响应，否则会被断开 (1001 Ping timeout)
+                                    ping_count += 1
+                                    last_ping_received = time.monotonic()
+                                    
+                                    try:
+                                        t_recv = time.monotonic()
+                                        await ws.send(bytes([0xfb]))
+                                        t_sent = time.monotonic()
+                                        response_time_ms = (t_sent - t_recv) * 1000
+                                        logging.info(f"心跳 #{ping_count}: Ping -> Pong (响应时间: {response_time_ms:.2f}ms)")
+                                        log_last('INFO', f"心跳 #{ping_count}: Ping -> Pong ({response_time_ms:.2f}ms)")
+                                        pong_failures = 0
+                                    except (websockets.exceptions.ConnectionClosed,
+                                            websockets.exceptions.ConnectionClosedError,
+                                            websockets.exceptions.ConnectionClosedOK) as e:
+                                        err_msg = str(e) if str(e) else e.__class__.__name__
+                                        time_since_last_ping = time.monotonic() - last_ping_received
+                                        logging.warning(f"[主连接] 发送 Pong 时连接已关闭: {err_msg} (距上次Ping: {time_since_last_ping:.1f}s, 总计收到{ping_count}个Ping)")
+                                        log_last('ERROR', f"[主连接] 发送 Pong 时连接已关闭: {err_msg} (距上次Ping: {time_since_last_ping:.1f}s, 总计{ping_count}个Ping)")
+                                        return
+                                    except Exception as e:
+                                        err_msg = str(e) if str(e) else e.__class__.__name__
+                                        pong_failures += 1
+                                        logging.warning(f"发送 Pong 失败 (#{pong_failures}): {err_msg}")
+                                        log_last('ERROR', f"发送 Pong 失败 (#{pong_failures}): {err_msg}")
+                                        if pong_failures >= 3:
+                                            logging.error(f"Pong 连续失败 {pong_failures} 次，标记需要重连")
+                                            log_last('ERROR', f"Pong 连续失败 {pong_failures} 次，标记需要重连")
+                                            need_reconnect = True
+                                            return
+                                            
                                 elif opcode == 0xff:  # 绘画结果
+                                    opcode_stats['0xff'] += 1
                                     if offset + 5 > len(data):
                                         break
                                     paint_id = int.from_bytes(data[offset:offset+4], 'little')
                                     status_code = data[offset+4]
-                                    logging.debug(f"收到绘画结果: ID={paint_id}, 状态=0x{status_code:x}")
+                                    
+                                    task = active_tasks.get(paint_id)
+                                    if not task and status_code == 0xef:
+                                        # 调试：成功响应但找不到任务记录
+                                        log_last('WARNING', f"收到成功响应(0xef) 但找不到任务 paint_id={paint_id}，active_tasks数量={len(active_tasks)}")
+                                    
+                                    if task:
+                                        uid = task['uid']
+                                        pos = task['pos']
+                                        r, g, b = task['color']
+                                        
+                                        if status_code == 0xef:
+                                            # 成功响应（仅用于重置失败计数器，success已在发送时计入）
+                                            # 注意：stats['success'] 已在发送时 += 1，这里不再重复计数
+                                            
+                                            # 重置失败计数器
+                                            if uid in token_states:
+                                                token_states[uid]['fail_count'] = 0
+                                                token_states[uid]['invalid_count'] = 0
+                                            
+                                            # 更新用户快照（用于统计）
+                                            snap = user_last_snapshot.get(uid)
+                                            if snap is None:
+                                                snap = OrderedDict()
+                                                user_last_snapshot[uid] = snap
+                                            snap[pos] = (r, g, b)
+                                            while len(snap) > SNAPSHOT_SIZE:
+                                                snap.popitem(last=False)
+                                            
+                                            # 乐观更新 board_state（稍后 0xfa 会确认）
+                                            board_state[pos] = (r, g, b)
+                                            
+                                            # 清理任务记录
+                                            del active_tasks[paint_id]
+                                        else:
+                                            # 失败响应处理
+                                            if uid in token_states:
+                                                token_states[uid]['fail_count'] += 1
+                                            
+                                            # 特殊处理不同的错误码
+                                            if status_code == 0xed:  # Token 无效
+                                                if uid in token_states:
+                                                    token_states[uid]['invalid_count'] += 1
+                                                    invalid_cnt = token_states[uid]['invalid_count']
+                                                    logging.warning(f"【Token失效】uid={uid} 收到 0xed 错误（第{invalid_cnt}次），标记需要刷新")
+                                                    log_last('ERROR', f"Token失效 uid={uid} (0xed) 第{invalid_cnt}次")
+                                                    # 标记此用户需要刷新 token
+                                                    token_refresh_needed.add(uid)
+                                                else:
+                                                    logging.warning(f"【Token失效】uid={uid} 收到 0xed 错误，但用户不在状态表中")
+                                                    log_last('ERROR', f"Token失效 uid={uid} (0xed) 用户不在状态表")
+                                            elif status_code == 0xee:  # 冷却中
+                                                pass  # 冷却错误太频繁，不记录
+                                            elif status_code == 0xec:  # 请求格式错误
+                                                logging.warning(f"绘画请求格式错误(0xec) uid={uid} ID={paint_id} Pos={pos}")
+                                                log_last('ERROR', f"请求格式错误 (0xec) uid={uid} Pos={pos}")
+                                            elif status_code == 0xeb:  # 无权限
+                                                logging.warning(f"绘画无权限(0xeb) uid={uid} ID={paint_id} Pos={pos}")
+                                                log_last('ERROR', f"绘画无权限 (0xeb) uid={uid} Pos={pos}")
+                                            elif status_code == 0xea:  # 服务器错误
+                                                logging.warning(f"服务器错误(0xea) uid={uid} ID={paint_id} Pos={pos}")
+                                                log_last('ERROR', f"服务器错误 (0xea) uid={uid} Pos={pos}")
+                                            else:
+                                                logging.debug(f"绘画失败(0x{status_code:x}) uid={uid} ID={paint_id} Pos={pos}")
+                                            
+                                            # 清理任务记录
+                                            del active_tasks[paint_id]
+
                                     offset += 5
                                 elif opcode == 0xfa:  # 画板像素更新广播 x(2) y(2) rgb(3)
+                                    opcode_stats['0xfa'] += 1
                                     if offset + 7 > len(data):
                                         break
                                     try:
                                         x = int.from_bytes(data[offset:offset+2], 'little'); offset += 2
                                         y = int.from_bytes(data[offset:offset+2], 'little'); offset += 2
                                         r, g, b = data[offset], data[offset+1], data[offset+2]; offset += 3
+                                        
+                                        # 【性能优化】简化画板更新处理，避免遍历 active_tasks
+                                        # 0xff 已经足够准确地处理绘画结果，0xfa 只需更新状态
                                         board_state[(x, y)] = (r, g, b)
-                                        logging.debug(f"画板更新: ({x},{y}) -> ({r},{g},{b})")
-                                        # attribute this board update to any pending paint that tried to set same pos/color recently
-                                        try:
-                                            now = time.monotonic()
-                                            matched = None
-                                            # find a pending paint that matches (x,y) and color within timeout
-                                            for p in list(pending_paints):
-                                                if p['pos'] == (x, y) and p['color'] == (r, g, b) and now - p['time'] <= PENDING_TIMEOUT:
-                                                    matched = p
-                                                    break
-                                            if matched is not None:
-                                                uid_matched = matched['uid']
-                                                log_to_web_if_available(gui_state, f"上一轮成功绘画的坐标: ({x}, {y}) by UID {uid_matched}")
-                                                # record into user's last snapshot (ordered dict to keep recent entries)
-                                                snap = user_last_snapshot.get(uid_matched)
-                                                if snap is None:
-                                                    snap = OrderedDict()
-                                                    user_last_snapshot[uid_matched] = snap
-                                                snap[matched['pos']] = matched['color']
-                                                # keep only latest SNAPSHOT_SIZE items
-                                                while len(snap) > SNAPSHOT_SIZE:
-                                                    snap.popitem(last=False)
-                                                # remove matched pending paint
-                                                try:
-                                                    pending_paints.remove(matched)
-                                                except Exception:
-                                                    pass
-                                        except Exception:
-                                            pass
-                                        # 若更新触及目标区域，唤醒调度器以便即时修复
-                                        if (x, y) in target_map:
-                                            state_changed_event.set()
-                                            # 若该位置在 in-flight，则移除（已确认或被覆盖）
-                                            try:
-                                                inflight.discard((x, y))
-                                            except Exception:
-                                                pass
-                                        # 同步到 GUI（实时画板预览）
+                                        
+                                        # 同步到 GUI（批量更新以减少锁竞争）
                                         if gui_state is not None:
                                             try:
                                                 with gui_state['lock']:
-                                                    # 仅同步画板像素到 GUI，热力图功能已移除，故不再记录 pixel_hits
                                                     gui_state['board_state'][(x, y)] = (r, g, b)
                                             except Exception:
                                                 pass
-                                        # 清理过期的 pending_paints，并同步 inflight 集合以允许重试
-                                        try:
-                                            now = time.monotonic()
-                                            pending_paints[:] = [p for p in pending_paints if now - p['time'] <= PENDING_TIMEOUT]
-                                            try:
-                                                # 将 inflight 与仍在 pending_paints 中的位置做交集，
-                                                # 这样超时未确认的 pos 会从 inflight 中移除并在后续调度中被重试。
-                                                pending_positions = set(p['pos'] for p in pending_paints)
-                                                inflight.intersection_update(pending_positions)
-                                            except Exception:
-                                                # 如果同步失败也不要阻塞主流程
-                                                pass
-                                        except Exception:
-                                            pass
                                     except Exception:
                                         # 出错则跳过此条
                                         pass
                                 else:
+                                    opcode_stats['other'] += 1
                                     logging.warning(f"收到未知操作码: 0x{opcode:x}")
                             
                             # 成功处理消息后重置错误计数
@@ -866,15 +1180,14 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         except Exception as e:
                             err_msg = str(e) if str(e) else e.__class__.__name__
                             err_type = e.__class__.__name__
-                            logging.warning(f"处理消息时出错 ({err_type}): {err_msg}")
-                            consecutive_errors += 1
-                            if consecutive_errors >= max_consecutive_errors:
-                                logging.error(f"消息处理连续失败 {consecutive_errors} 次，接收任务退出。")
-                                break
+                            # 【修复】消息解析错误不应导致任务退出，只记录警告
+                            logging.warning(f"处理消息时出错 ({err_type}): {err_msg}，跳过此消息")
+                            log_last('WARNING', f"消息解析错误 ({err_type}): {err_msg}")
                     
                     # 正常退出循环（连接关闭）
                     logging.info(f"WebSocket 消息流结束（共接收 {message_count} 条消息），接收任务退出。")
-                    if 'ping_proc' in locals() and ping_proc is not None:
+                    log_last('WARNING', f"WebSocket 消息流结束，共接收 {message_count} 条消息，接收任务退出")
+                    if ping_proc is not None:
                         logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)} 状态: {'alive' if ping_proc.is_alive() else 'stopped'}")
                     else:
                         logging.info("Ping 进程信息不可用（使用内置心跳或未创建）")
@@ -884,14 +1197,16 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         websockets.exceptions.ConnectionClosedOK) as e:
                     err_msg = str(e) if str(e) else e.__class__.__name__
                     logging.info(f"WebSocket 连接已关闭: {err_msg} (接收了 {message_count} 条消息)")
-                    if 'ping_proc' in locals() and ping_proc is not None:
+                    log_last('ERROR', f"WebSocket 连接已关闭: {err_msg} (接收了 {message_count} 条消息)")
+                    if ping_proc is not None:
                         logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)} 状态: {'alive' if ping_proc.is_alive() else 'stopped'}")
                     else:
                         logging.info("Ping 进程信息不可用（使用内置心跳或未创建）")
                 except asyncio.CancelledError:
                     # 任务被取消时正常退出
-                    logging.debug(f"接收任务被取消 (已接收 {message_count} 条消息)")
-                    if 'ping_proc' in locals() and ping_proc is not None:
+                    logging.debug(f"接收任务被取消 (已接收 {message_count} 条消息: Ping={opcode_stats['0xfc']}, 绘画结果={opcode_stats['0xff']}, 画板更新={opcode_stats['0xfa']}, 其他={opcode_stats['other']})")
+                    log_last('INFO', f"接收任务被取消 (消息: {message_count}条, Ping={opcode_stats['0xfc']}, 结果={opcode_stats['0xff']}, 更新={opcode_stats['0xfa']}, 其他={opcode_stats['other']})")
+                    if ping_proc is not None:
                         logging.debug(f"Ping 进程 pid={getattr(ping_proc,'pid',None)} 状态: {'alive' if ping_proc.is_alive() else 'stopped'}")
                     else:
                         logging.debug("Ping 进程信息不可用（使用内置心跳或未创建）")
@@ -900,7 +1215,8 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     err_msg = str(e) if str(e) else e.__class__.__name__
                     err_type = e.__class__.__name__
                     logging.exception(f"WebSocket 接收处理时发生未预期异常 ({err_type}): {err_msg}")
-                    if 'ping_proc' in locals() and ping_proc is not None:
+                    log_last('ERROR', f"WebSocket 接收未预期异常 ({err_type}): {err_msg}")
+                    if ping_proc is not None:
                         logging.info(f"Ping 进程 pid={getattr(ping_proc,'pid',None)} 状态: {'alive' if ping_proc.is_alive() else 'stopped'}")
                     else:
                         logging.info("Ping 进程信息不可用（使用内置心跳或未创建）")
@@ -909,37 +1225,127 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
 
             receiver_task = asyncio.create_task(receiver())
 
+            # 定义重新获取快照的函数
+            is_fetching_snapshot = False
+            async def try_refetch_snapshot():
+                nonlocal is_fetching_snapshot
+                if is_fetching_snapshot:
+                    return
+                is_fetching_snapshot = True
+                try:
+                    logging.info("检测到画板状态为空，正在重新获取快照...")
+                    loop = asyncio.get_running_loop()
+                    snapshot = await loop.run_in_executor(None, tool.fetch_board_snapshot)
+                    if snapshot:
+                        board_state.update(snapshot)
+                        logging.info(f"成功重新获取画板快照，包含 {len(snapshot)} 个像素")
+                        # 更新 GUI
+                        if gui_state is not None:
+                            with gui_state['lock']:
+                                gui_state['board_state'] = board_state.copy()
+                except Exception as e:
+                    logging.warning(f"重新获取画板快照失败: {e}")
+                finally:
+                    is_fetching_snapshot = False
+
             # 启动进度显示器（每秒刷新）
             async def progress_printer():
+                # 声明需要修改的外层变量
+                nonlocal zero_growth_seconds, need_reconnect
+                
                 # 使用 rich 渲染更美观的进度条
                 mode_prefix = f"[{len(images_data)}图] "
                 history = deque()
                 window_seconds = 60.0
+                
+                # 用于计算每秒成功绘制像素数（基于 stats['success']）
+                pixels_history = deque()  # [(timestamp, success_count), ...]
+                pixels_window_seconds = 10.0  # 10秒窗口计算平均速度
 
                 console = Console()
                 progress = Progress(
                     SpinnerColumn(),
-                    TextColumn("{task.description}"),
-                    BarColumn(bar_width=40),
+                    TextColumn("[bold blue]{task.fields[line1]}"),
+                    BarColumn(bar_width=30),  # 缩短进度条
                     TextColumn("{task.percentage:>3.0f}%"),
                     TimeRemainingColumn(),
+                    TextColumn("\n[cyan]{task.fields[line2]}"),
                     console=console,
                     transient=False,
+                    refresh_per_second=2,  # 降低刷新率
                 )
-                task_id = progress.add_task(f"{mode_prefix}进度", total=100)
+                task_id = progress.add_task(
+                    f"{mode_prefix}进度", 
+                    total=100,
+                    line1="初始化...",
+                    line2=""
+                )
                 progress.start()
+                # 立即更新一次，确保进度条显示
+                progress.update(task_id, completed=0)
                 try:
                     while True:
+                        # 记录当前时间，供后续多个指标使用
+                        now = time.monotonic()
+
                         # 计算完成度（不符合的像素数会降低完成度）
                         total = len(target_positions)
-                        mismatched = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
+                        if not board_state:
+                            mismatched = total
+                            # 画板为空时尝试重新获取
+                            if int(now) % 10 == 0:
+                                asyncio.create_task(try_refetch_snapshot())
+                        else:
+                            mismatched = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
                         completed = max(0, total - mismatched)
                         pct = (completed / total * 100) if total > 0 else 100.0
+                        
+                        # 计算每秒成功绘制的像素数（基于收到 0xef 响应的次数）
+                        success_count = stats['success']
+                        pixels_history.append((now, success_count))
+                        while pixels_history and (now - pixels_history[0][0] > pixels_window_seconds):
+                            pixels_history.popleft()
+                        
+                        pixels_per_sec = 0.0
+                        if len(pixels_history) >= 2:
+                            t0, p0 = pixels_history[0]
+                            t1, p1 = pixels_history[-1]
+                            dt = max(1e-6, t1 - t0)
+                            pixels_per_sec = (p1 - p0) / dt
+                        
+                        # 【自动重连检测】检测像素增长是否为0，连续超过阈值则触发重连
+                        # 条件：有未达成像素 且 有可用token 且 像素增长为0
+                        if mismatched > 0 and len(users_with_tokens) > 0 and pixels_per_sec < 0.01:
+                            zero_growth_seconds += 1
+                            if zero_growth_seconds >= ZERO_GROWTH_RECONNECT_THRESHOLD:
+                                logging.warning(f"检测到连续 {zero_growth_seconds} 秒无像素增长，标记需要重连")
+                                need_reconnect = True
+                                zero_growth_seconds = 0  # 重置计数避免重复触发
+                        else:
+                            # 有增长，重置计数
+                            if zero_growth_seconds > 0:
+                                logging.debug(f"像素增长恢复，重置零增长计数（之前: {zero_growth_seconds}秒）")
+                            zero_growth_seconds = 0
+                        
+                        # 【连接健康检测】检查是否长时间没有收到服务器消息
+                        # 服务器应该定期发送心跳，如果超过60秒没有任何消息，可能连接已死
+                        MESSAGE_TIMEOUT = 60.0
+                        time_since_last_message = now - last_message_time
+                        if time_since_last_message > MESSAGE_TIMEOUT:
+                            logging.warning(f"超过 {time_since_last_message:.1f}s 未收到服务器消息，可能连接已死，标记需要重连")
+                            need_reconnect = True
 
                         # 可用用户数与就绪数
-                        now = time.monotonic()
                         available = len(users_with_tokens)
-                        ready_count = len([u for u in users_with_tokens if cooldown_until.get(u['uid'], 0.0) <= now])
+                        # 使用 token_states 计算就绪数：已过冷却期即可用
+                        ready_count = 0
+                        for u in users_with_tokens:
+                            uid = u['uid']
+                            state = token_states.get(uid)
+                            if state:
+                                # 检查是否过了冷却期
+                                if now - state['last_success'] >= user_cooldown_seconds:
+                                    ready_count += 1
 
                         # 计算抵抗率
                         resistance_pct = None
@@ -1001,7 +1407,7 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                                         eta_str = f'  估计剩余: {int(eta_s)}s'
                                 else:
                                     if pct < 95.0:
-                                        eta_str = '  估计剩余: 我们正在被攻击，无法抵抗'
+                                        eta_str = '  估计剩余: 无限大'
                                     else:
                                         eta_str = '  估计剩余: 即将完成'
                         except Exception:
@@ -1023,18 +1429,86 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         except Exception:
                             res_part = ''
 
-                        # 构造描述并更新 progress
-                        danger_mark = ' ⚠️' if danger else ''
-                        desc = f"{mode_prefix}可用:{available} 就绪:{ready_count} 未达:{mismatched} | {res_part}{growth_str}{eta_str}{danger_mark}"
+                        # 计算CD中的token利用率：(CD中的token数 / 总token数) * 100%
+                        cd_util_str = ''
                         try:
-                            progress.update(task_id, completed=pct, description=desc)
-                        except Exception:
-                            # 回退为直接输出
-                            out_line = f"{mode_prefix}进度: [{int(pct):3d}%] 可用:{available} (就绪:{ready_count}) 未达:{mismatched} {res_part}{growth_str}{eta_str}"
-                            if debug:
-                                logging.info(out_line)
+                            total_tokens = len(users_with_tokens)
+                            if total_tokens > 0:
+                                # 统计正在CD中的token数（距离上次成功时间 < 冷却时间）
+                                tokens_in_cd = 0
+                                for u in users_with_tokens:
+                                    uid = u['uid']
+                                    state = token_states.get(uid)
+                                    if state:
+                                        # 如果在冷却期内，则认为在CD中
+                                        if now - state['last_success'] < user_cooldown_seconds:
+                                            tokens_in_cd += 1
+                                cd_util_rate = (tokens_in_cd / total_tokens) * 100.0
+                                cd_util_str = f"CD利用:{cd_util_rate:5.1f}%"
                             else:
-                                sys.stdout.write('\r' + out_line)
+                                cd_util_str = "CD利用: --"
+                        except Exception:
+                            cd_util_str = "CD利用: --"
+                        
+                        # 计算效率：实际每秒像素数 / 理论每秒像素数
+                        # 理论每秒像素数 = token总数 / CD时间
+                        efficiency_str = ''
+                        try:
+                            total_tokens = len(users_with_tokens)
+                            if total_tokens > 0 and user_cooldown_seconds > 0:
+                                theoretical_pps = total_tokens / user_cooldown_seconds
+                                if theoretical_pps > 0:
+                                    efficiency_rate = (pixels_per_sec / theoretical_pps) * 100.0
+                                    efficiency_str = f"效率:{efficiency_rate:5.1f}%"
+                                else:
+                                    efficiency_str = "效率: --"
+                            else:
+                                efficiency_str = "效率: --"
+                        except Exception:
+                            efficiency_str = "效率: --"
+
+                        # 构造多行描述信息
+                        danger_mark = '⚠️' if danger else ''
+                        
+                        pixels_per_sec_str = f"{pixels_per_sec:+.1f}px/s" if pixels_per_sec != 0 else "0px/s"
+                        success_total = stats['success']
+                        
+                        # 第一行：基本状态（紧凑格式）
+                        line1_parts = [
+                            f"{mode_prefix}可用:{available}",
+                            f"就绪:{ready_count}",
+                            f"未达:{mismatched}"
+                        ]
+                        if danger_mark:
+                            line1_parts.insert(0, danger_mark)
+                        line1 = ' | '.join(line1_parts)
+                        
+                        # 第二行：合并所有指标（紧凑格式）
+                        line2_parts = [
+                            f"速度:{pixels_per_sec_str}",
+                            f"累计:{success_total}px",
+                            cd_util_str,
+                            efficiency_str,
+                            res_part,
+                            growth_str.strip(),
+                            eta_str.strip()
+                        ]
+                        line2 = ' | '.join([p.strip() for p in line2_parts if p.strip()])
+
+                        try:
+                            progress.update(
+                                task_id, 
+                                completed=pct,
+                                line1=line1,
+                                line2=line2
+                            )
+                        except Exception as e:
+                            # 回退为直接输出（简化版）
+                            out_line = f"\r{mode_prefix}进度: [{int(pct):3d}%] 可用:{available} 就绪:{ready_count} 未达:{mismatched} 速度:{pixels_per_sec_str} {cd_util_str} {efficiency_str}"
+                            if debug:
+                                logging.info(out_line.strip())
+                            else:
+                                sys.stdout.write(out_line)
                                 sys.stdout.flush()
 
                         # 若 GUI 请求停止则退出循环
@@ -1049,67 +1523,75 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         pass
 
             # 调度：支持冷却与持续监视
-            user_counters = {u['uid']: 0 for u in users_with_tokens}
-            cooldown_until = {u['uid']: 0.0 for u in users_with_tokens}  # monotonic 时间戳
-            in_watch_mode = False
-            round_idx = 0
-            # 【性能优化】使用 deque 作为剩余任务队列以获得 O(1) 的 popleft
-            from collections import deque as _deque
-            remaining = _deque()
-            last_remaining_update = 0.0
-            # 累计派发计数（按配置索引聚合）
-            from collections import defaultdict as _dd
-            assigned_counter_per_image = _dd(int)
+            # 使用全局 paint_id 计数器，避免不同用户生成相同的 paint_id 导致 pending_paints 冲突
+            global_paint_id = 0
+            
+            # 性能统计（每10秒输出一次诊断信息）
+            last_perf_log = time.monotonic()
+            perf_stats = {
+                'loops': 0,
+                'assigned': 0,
+                'scanned': 0,
+                'no_ready': 0
+            }
 
-            # 现在 cooldown_until 已初始化，再启动进度显示器
+            # 启动进度显示器（每秒刷新）
             progress_task = asyncio.create_task(progress_printer())
-
-            # 轮转图片列表与游标（避免某一模式/图片饿死）
-            try:
-                rr_images_raw = sorted(set(pos_to_image_idx.values()))
-            except Exception:
-                rr_images_raw = []
-            # 根据 images_data 中记录的 config_index -> weight 构建加权轮转列表
-            weight_map = {}
-            try:
-                for img in images_data:
-                    cfg_idx = img.get('config_index')
-                    if cfg_idx is not None:
-                        weight_map[cfg_idx] = float(img.get('weight', 1.0))
-            except Exception:
-                weight_map = {}
-
-            rr_images = []
-            # 缩放因子：每个权重单位大约重复的基数（1.0 -> 10 次），可调
-            scale = 10
-            for cfg_idx in rr_images_raw:
-                w = max(0.0, weight_map.get(cfg_idx, 1.0))
-                repeat = max(1, int(round(w * scale)))
-                rr_images.extend([cfg_idx] * repeat)
-            # 若所有 weight 都异常导致 rr_images 为空，则回退为 raw 列表
-            if not rr_images:
-                rr_images = rr_images_raw
-            # 调试信息：记录每个配置索引的权重与在轮转列表中的出现次数
-            try:
-                from collections import Counter
-                dist = Counter(rr_images)
-                logging.debug(f"轮转队列权重映射: {weight_map} -> 轮转分布: {dict(dist)} (scale={scale})")
-            except Exception:
-                pass
-            rr_cursor = 0
 
             # 健康检查：定期验证连接和任务状态
             last_health_check = time.monotonic()
             health_check_interval = 10  # 每10秒进行一次完整健康检查
             last_task_check = time.monotonic()
-            task_check_interval = 2  # 每2秒快速检查任务状态
+            task_check_interval = 0.1  # 【优化】每0.1秒快速检查任务状态（原0.5秒太长）
             connection_warnings = 0  # 连续警告次数
-            max_connection_warnings = 3  # 允许3次连续警告再退出
+            max_connection_warnings = 2  # 【优化】允许2次连续警告再退出（原3次太多）
             
             while True:
                 now = time.monotonic()
                 
-                # 快速任务状态检查（每2秒）- 优先检测任务退出
+                # 0. 【自动重连检测】检查 need_reconnect 标志
+                if need_reconnect:
+                    logging.warning("检测到需要重连标志，退出当前循环以便重连。")
+                    try:
+                        tasks_to_cancel = []
+                        if not progress_task.done():
+                            progress_task.cancel()
+                            tasks_to_cancel.append(progress_task)
+                        if not sender_task.done():
+                            sender_task.cancel()
+                            tasks_to_cancel.append(sender_task)
+                        if not receiver_task.done():
+                            receiver_task.cancel()
+                            tasks_to_cancel.append(receiver_task)
+                        
+                        if tasks_to_cancel:
+                            await asyncio.wait_for(
+                                asyncio.gather(*tasks_to_cancel, return_exceptions=True),
+                                timeout=2.0
+                            )
+                    except asyncio.TimeoutError:
+                        logging.debug("等待任务取消超时")
+                    except Exception as e:
+                        logging.debug(f"取消任务时出错: {e}")
+                    break
+
+                # 1. 清理陈旧的active_tasks记录（仅用于统计，不影响Token使用）
+                # 保留最近5秒内的任务记录即可
+                stale_ids = [pid for pid, task in active_tasks.items() if now - task['time'] > 5.0]
+                for pid in stale_ids:
+                    active_tasks.pop(pid, None)
+                
+                # 【修复】定期清理 pos_locks 中过期的条目，避免内存无限增长
+                # 每1000次循环清理一次（避免每次循环都遍历大字典）
+                if perf_stats['loops'] % 1000 == 0 and pos_locks:
+                    expired_positions = [pos for pos, expire_time in pos_locks.items() if now >= expire_time]
+                    for pos in expired_positions:
+                        pos_locks.pop(pos, None)
+                    if expired_positions:
+                        logging.debug(f"清理了 {len(expired_positions)} 个过期的位置锁")
+                        log_last('DEBUG', f"清理了 {len(expired_positions)} 个过期的位置锁，当前锁数: {len(pos_locks)}")
+
+                # 2. 快速任务状态检查（每0.1秒）- 优先检测任务退出
                 if now - last_task_check >= task_check_interval:
                     last_task_check = now
                     connection_issue = False
@@ -1120,12 +1602,17 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                             try:
                                 exc = sender_task.exception() if not sender_task.cancelled() else None
                                 if exc:
-                                    logging.error(f"发送任务异常退出: {exc}")
+                                    logging.error(f"【关键】发送任务异常退出: {exc}")
+                                    log_last('ERROR', f"发送任务异常退出: {exc}")
                                     connection_issue = True
                                 else:
-                                    logging.debug("发送任务已退出（无异常）")
+                                    logging.warning("【关键】发送任务已退出（无异常），这会导致停止绘制！")
+                                    log_last('ERROR', "发送任务已退出（无异常），这会导致停止绘制！")
+                                    connection_issue = True  # 即使无异常，任务退出也需要重连
                             except Exception as e:
-                                logging.debug(f"发送任务已退出: {e}")
+                                logging.warning(f"【关键】发送任务已退出: {e}")
+                                log_last('ERROR', f"发送任务已退出: {e}")
+                                connection_issue = True
                     except Exception as e:
                         logging.debug(f"检查发送任务状态时出错: {e}")
                     
@@ -1135,12 +1622,17 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                             try:
                                 exc = receiver_task.exception() if not receiver_task.cancelled() else None
                                 if exc:
-                                    logging.error(f"接收任务异常退出: {exc}")
+                                    logging.error(f"【关键】接收任务异常退出: {exc}")
+                                    log_last('ERROR', f"接收任务异常退出: {exc}")
                                     connection_issue = True
                                 else:
-                                    logging.debug("接收任务已退出（无异常）")
+                                    logging.warning("【关键】接收任务已退出（无异常），这会导致无法接收心跳！")
+                                    log_last('ERROR', "接收任务已退出（无异常），这会导致无法接收心跳！")
+                                    connection_issue = True  # 接收任务退出也需要重连
                             except Exception as e:
-                                logging.debug(f"接收任务已退出: {e}")
+                                logging.warning(f"【关键】接收任务已退出: {e}")
+                                log_last('ERROR', f"接收任务已退出: {e}")
+                                connection_issue = True
                     except Exception as e:
                         logging.debug(f"检查接收任务状态时出错: {e}")
                     
@@ -1193,7 +1685,7 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         logging.info("任务已取消，即将退出 WebSocket 上下文并返回 run_forever 进行重连")
                         break
                 
-                # 完整健康检查（每10秒）- 包含详细日志
+                # 3. 完整健康检查（每10秒）- 包含详细日志
                 if now - last_health_check >= health_check_interval:
                     last_health_check = now
                     
@@ -1247,7 +1739,8 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         logging.debug(f"健康检查：任务状态 [发送:{sender_ok} 接收:{receiver_ok} 进度:{progress_ok}]")
                     else:
                         logging.debug(f"健康检查通过：连接正常，所有任务运行中")
-                # 优先处理 GUI 请求的配置刷新（如图片路径、起点或模式被修改并调用 refresh_config）
+                
+                # 4. 优先处理 GUI 请求的配置刷新
                 if gui_state is not None and gui_state.get('reload_pixels'):
                     try:
                         with gui_state['lock']:
@@ -1264,17 +1757,7 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                         for mode in ['horizontal', 'concentric', 'random']:
                             if mode in positions_by_mode:
                                 target_positions.extend(positions_by_mode[mode])
-                        # 重建图片轮转队列
-                        try:
-                            rr_images = sorted(set(pos_to_image_idx.values()))
-                        except Exception:
-                            rr_images = []
-                        rr_cursor = 0
-                        # 新配置后重置累计派发计数
-                        try:
-                            assigned_counter_per_image.clear()
-                        except Exception:
-                            pass
+                        
                         if gui_state is not None:
                             with gui_state['lock']:
                                 gui_state['total'] = len(target_positions)
@@ -1284,85 +1767,7 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     except Exception:
                         logging.exception('处理 GUI 刷新请求时出错')
 
-                # 若后台视频帧已更新，重新构建目标映射以反映新帧（注入的视频作为虚拟图片由 tool.VIDEO_STATE 管理）
-                try:
-                    if getattr(tool, 'VIDEO_FRAME_UPDATED', False):
-                        tool.VIDEO_FRAME_UPDATED = False
-                        _res2 = tool.merge_target_maps(images_data)
-                        if isinstance(_res2, tuple) and len(_res2) == 3:
-                            target_map, positions_by_mode, pos_to_image_idx = _res2
-                        else:
-                            target_map, positions_by_mode = _res2
-                            pos_to_image_idx = {}
-                        # rebuild merged positions list and per-image grouping
-                        target_positions = []
-                        for mode in ['horizontal', 'concentric', 'random']:
-                            if mode in positions_by_mode:
-                                target_positions.extend(positions_by_mode[mode])
-                        from collections import defaultdict, deque as _deque
-                        positions_by_image = defaultdict(list)
-                        for pos in target_positions:
-                            idx = pos_to_image_idx.get(pos)
-                            if idx is not None:
-                                positions_by_image[idx].append(pos)
-                        positions_by_image = {k: _deque(v) for k, v in positions_by_image.items()}
-                        # reset remaining queue so scheduler will consider new targets immediately
-                        remaining = _deque([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
-                        last_remaining_update = time.monotonic()
-                        logging.debug('检测到视频帧更新，已重建目标映射以反映新帧')
-                except Exception:
-                    logging.exception('处理视频帧更新时出错')
-
-                # 如果存在虚拟视频图片，检查当前视频帧是否已全部绘制完成，完成后推进到下一帧（不再使用 CRT 隔行）
-                try:
-                    # 遍历 images_data 查找 type=='video' 的虚拟图片
-                    for img in images_data:
-                        if str(img.get('type', '')).lower() != 'video':
-                            continue
-                        folder = img.get('folder') or img.get('image_path')
-                        if not folder:
-                            continue
-                        vs = tool.VIDEO_STATE.get(folder)
-                        if not vs:
-                            continue
-                        cfg_idx = img.get('config_index')
-                        if cfg_idx is None:
-                            continue
-                        # 收集属于此视频虚拟图片的所有目标坐标
-                        video_positions = [pos for pos, idx in pos_to_image_idx.items() if idx == cfg_idx]
-                        if not video_positions:
-                            continue
-                        # 计算已达成的像素比例，达到配置的 complete_rate 即可推进
-                        try:
-                            matched = 0
-                            for p in video_positions:
-                                if board_state.get(p) == target_map.get(p):
-                                    matched += 1
-                            total = len(video_positions)
-                            ratio = (matched / total) if total > 0 else 0.0
-                            threshold = float(vs.get('complete_rate', 1.0))
-                        except Exception:
-                            matched = 0
-                            total = len(video_positions)
-                            ratio = 0.0
-                            threshold = float(vs.get('complete_rate', 1.0))
-
-                        logging.debug(f"视频完成率: {matched}/{total} = {ratio:.2%}, 阈值 {threshold:.2%} (folder={folder})")
-
-                        if ratio >= threshold:
-                            # 若配置为非循环且已到最后一帧，则不再推进
-                            if not bool(vs.get('loop', True)) and int(vs.get('frame', 1)) >= int(vs.get('frame_count', 1)):
-                                logging.info(f"视频已完成最后一帧: folder={folder} frame={vs.get('frame')}")
-                                continue
-                            # 推进到下一帧（1-based）
-                            cur = int(vs.get('frame', 1))
-                            cur = (cur % int(vs.get('frame_count', 1))) + 1
-                            vs['frame'] = cur
-                            tool.VIDEO_FRAME_UPDATED = True
-                            logging.info(f"视频完成率达到阈值，推进到下一帧: folder={folder} frame={cur} (达成 {ratio:.2%})")
-                            # 发现并推进一个视频后可继续检查下一个（若有多个视频）
-                except Exception:
-                    logging.exception('视频完成检测时出错')
+                # 视频功能已废弃
 
                 # 若 GUI 模式要求停止，退出循环
                 if gui_state is not None and gui_state.get('stop'):
@@ -1372,144 +1777,228 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
                     sender_task.cancel()
                     receiver_task.cancel()
                     break
-                now = time.monotonic()
-                # 未达目标色（未知状态也视为未完成）
-                # 使用 deque 保存 remaining（未达到目标的绝对坐标），并在周期性更新时重建队列。
-                # 同时跳过已经在 inflight 中的坐标以避免重复分配。
-                if last_remaining_update == 0.0:
-                    remaining = _deque([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
-                    last_remaining_update = now
-                else:
-                    # 每10轮或每秒更新一次 remaining，其他时候使用缓存队列
-                    if round_idx % 10 == 0 or (now - last_remaining_update) > 1.0:
-                        remaining = _deque([pos for pos in target_positions if board_state.get(pos) != target_map[pos] and pos not in inflight])
-                        last_remaining_update = now
-                    else:
-                        # 否则保留现有 remaining 队列（会在 popleft 时跳过已满足的位置）
-                        pass
-
-                # 可用用户（不在冷却期）
-                available_users = [u for u in users_with_tokens if cooldown_until.get(u['uid'], 0.0) <= now]
-
-                assigned = 0
-                if remaining and available_users:
-                    # 【性能优化】使用更高效的派发策略，避免每轮都重建复杂的字典结构
-                    # 简化版本：直接从 remaining 列表中按轮转策略取出像素分配给用户
+                
+                # 实时处理 Token 刷新请求（检测到 0xed 后立即刷新）
+                if token_refresh_needed:
+                    uids_to_refresh = list(token_refresh_needed)
+                    token_refresh_needed.clear()
+                    logging.info(f"【实时刷新】检测到 {len(uids_to_refresh)} 个用户 Token 失效，立即刷新...")
                     
-                    for user in available_users:
-                        if not remaining:
-                            break
-                        # 从队列头部取出一个尚未满足且不在 inflight 的位置（跳过已被外部更新的或正在处理的）
-                        pick = None
-                        while remaining:
-                            cand = remaining.popleft()
-                            # 如果此位置已达到目标颜色，跳过
-                            if board_state.get(cand) == target_map.get(cand):
-                                continue
-                            # 如果已在 inflight，则跳过以避免重复分配
-                            if cand in inflight:
-                                continue
-                            pick = cand
-                            break
-                        if pick is None:
-                            break
-                        x, y = pick
-                        r, g, b = target_map[(x, y)]
+                    try:
+                        # 在线程池中异步刷新 token
+                        async def refresh_tokens_async():
+                            def refresh_sync():
+                                refreshed = []
+                                for uid in uids_to_refresh:
+                                    # 从原配置中查找此 uid 的 access_key
+                                    user_cfg = None
+                                    for u in config.get('users', []):
+                                        if u.get('uid') == uid:
+                                            user_cfg = u
+                                            break
+                                    
+                                    if not user_cfg:
+                                        logging.warning(f"未找到 uid={uid} 的配置，无法刷新")
+                                        continue
+                                    
+                                    access_key = user_cfg.get('access_key')
+                                    if not access_key:
+                                        logging.warning(f"uid={uid} 没有 access_key，无法刷新")
+                                        continue
+                                    
+                                    try:
+                                        new_token = get_token(uid, access_key)
+                                        if new_token:
+                                            refreshed.append((uid, new_token))
+                                            logging.info(f"【刷新成功】uid={uid} 已获取新 token")
+                                        else:
+                                            logging.warning(f"【刷新失败】uid={uid} 未能获取新 token")
+                                    except Exception as e:
+                                        logging.error(f"【刷新异常】uid={uid} 刷新失败: {e}")
+                                return refreshed
+                            
+                            loop = asyncio.get_running_loop()
+                            return await loop.run_in_executor(None, refresh_sync)
+                        
+                        refreshed_tokens = await refresh_tokens_async()
+                        
+                        # 更新 users_with_tokens 中对应用户的 token
+                        for uid, new_token in refreshed_tokens:
+                            try:
+                                # 预计算 token_bytes
+                                try:
+                                    token_bytes = UUID(new_token).bytes
+                                except Exception:
+                                    token_bytes = UUID(hex=new_token.replace('-', '')).bytes
+                                
+                                # 查找并更新
+                                for i, u in enumerate(users_with_tokens):
+                                    if u['uid'] == uid:
+                                        users_with_tokens[i]['token'] = new_token
+                                        users_with_tokens[i]['token_bytes'] = token_bytes
+                                        logging.info(f"【已更新】uid={uid} 的 token 已更新到工作列表")
+                                        
+                                        # 重置失败计数器
+                                        if uid in token_states:
+                                            token_states[uid]['fail_count'] = 0
+                                            token_states[uid]['invalid_count'] = 0
+                                        break
+                            except Exception as e:
+                                logging.error(f"更新 uid={uid} token 时出错: {e}")
+                        
+                        if refreshed_tokens:
+                            logging.info(f"【实时刷新完成】成功刷新 {len(refreshed_tokens)}/{len(uids_to_refresh)} 个用户的 token")
+                    except Exception:
+                        logging.exception("实时刷新 token 时出错")
+                
+                # 7. 任务分配逻辑 (核心重构 - 性能优化版)
+                perf_stats['loops'] += 1
+                
+                # 性能诊断：定期输出统计信息（info级别，所有模式可见）
+                if now - last_perf_log >= 10:
+                    if perf_stats['loops'] > 0:
+                        avg_assigned = perf_stats['assigned'] / perf_stats['loops']
+                        avg_scanned = perf_stats['scanned'] / perf_stats['loops']
+                        no_ready_pct = (perf_stats['no_ready'] / perf_stats['loops']) * 100
+                        # 计算当前就绪token数（移除busy检查）
+                        ready_now = sum(1 for u in users_with_tokens 
+                                      if now - token_states[u['uid']]['last_success'] >= user_cooldown_seconds)
+                        # 计算利用率
+                        util_pct = (stats['success'] / stats['sent'] * 100) if stats['sent'] > 0 else 0
+                        perf_msg = f"就绪Token:{ready_now}/{len(users_with_tokens)} | 利用率:{util_pct:.1f}% | 每轮分配:{avg_assigned:.1f}任务 扫描:{avg_scanned:.0f}像素 | 已发送:{stats['sent']} 成功:{stats['success']} | pos_locks:{len(pos_locks)}"
+                        logging.info(f"[性能] {perf_msg}")
+                        log_last('INFO', f"[性能] {perf_msg}")
+                    perf_stats = {'loops': 0, 'assigned': 0, 'scanned': 0, 'no_ready': 0}
+                    last_perf_log = now
+                
+                # 7.1 筛选可用 Token
+                # 条件：当前时间 - 上次成功时间 >= 冷却时间
+                # 由于Token在发送后立即进入冷却，不再需要busy状态检查
+                ready_tokens = []
+                for u in users_with_tokens:
+                    uid = u['uid']
+                    state = token_states[uid]
+                    if now - state['last_success'] >= user_cooldown_seconds:
+                        ready_tokens.append(u)
+                
+                # 按上次成功时间排序（最久未使用的优先）
+                ready_tokens.sort(key=lambda u: token_states[u['uid']]['last_success'])
+                
+                if not ready_tokens:
+                    # 无可用 Token，极短等待后继续（不要阻塞太久）
+                    perf_stats['no_ready'] += 1
+                    await asyncio.sleep(0.001)
+                    continue
+                
+                # 7.2 批量扫描并分配任务（一次性尽可能多分配）
+                assigned_count = 0
+                
+                # 循环扫描逻辑：从上次结束的位置开始
+                total_targets = len(target_positions)
+                if total_targets > 0:
+                    steps = 0
+                    start_cursor = scan_cursor
+                    # 智能扫描策略：
+                    # - 如果ready_tokens很多（>50），扫描更多像素以充分利用
+                    # - 如果ready_tokens较少，限制扫描范围避免浪费时间
+                    # - 最多扫描完整一轮或ready_tokens数量的20倍（取较小值）
+                    token_count = len(ready_tokens)
+                    if token_count > 50:
+                        # Token充足，允许扫描更多以填满所有token
+                        max_steps = min(total_targets, token_count * 50)
+                    else:
+                        # Token较少，限制扫描范围
+                        max_steps = min(total_targets, token_count * 20)
+                    
+                    while ready_tokens and steps < max_steps:
+                        idx = (start_cursor + steps) % total_targets
+                        pos = target_positions[idx]
+                        steps += 1
+                        
+                        # 检查是否需要绘制
+                        target_color = target_map.get(pos)
+                        if not target_color:
+                            continue
+                            
+                        current_color = board_state.get(pos)
+                        if current_color == target_color:
+                            continue
+                        
+                        # 检查是否已被锁定（最近刚绘制过）
+                        lock_until = pos_locks.get(pos)
+                        if lock_until and now < lock_until:
+                            continue
+                        # 锁已过期或不存在，可以绘制
+                        
+                        # 分配任务
+                        user = ready_tokens.pop(0) # 取出最久未使用的 Token
                         uid = user['uid']
                         token_bytes = user.get('token_bytes')
                         uid_bytes3 = user.get('uid_bytes3')
-                        paint_id = user_counters[uid]
-                        # 标记为 in-flight，避免重复分配
-                        inflight.add(pick)
-                        # 调用同步的 paint 函数以避免每次分配产生 await/上下文切换开销
-                        tool.paint(ws, uid, token_bytes, uid_bytes3, r, g, b, x, y, paint_id)
+                        r, g, b = target_color
+                        
+                        # 生成 Paint ID
+                        paint_id = global_paint_id
+                        global_paint_id = (global_paint_id + 1) % 4294967296
+                        
+                        # 记录任务（仅用于统计和0xff响应匹配）
+                        task = {
+                            'pos': pos,
+                            'color': (r, g, b),
+                            'uid': uid,
+                            'time': now
+                        }
+                        active_tasks[paint_id] = task
+                        
+                        # 使用优化的 tool.paint 函数批量构建绘画数据
+                        tool.paint(ws, uid, token_bytes, uid_bytes3, r, g, b, pos[0], pos[1], paint_id)
+                        
+                        # 【关键优化】发送后立即释放Token并进入冷却，不等待任何响应
+                        # 这样可以最大化Token利用率，消除超时机制开销
+                        token_states[uid]['last_success'] = now
+                        
+                        # 位置锁：短暂锁定避免重复提交（锁定时间=冷却时间）
+                        pos_locks[pos] = now + user_cooldown_seconds
+                        
+                        stats['sent'] += 1
+                        # 【修复】将发送计入成功，因为即使被覆盖也代表实际吞吐量
+                        # 这样测量模式可以正确反映绘制速度，而不受对抗影响
+                        stats['success'] += 1
+                        assigned_count += 1
+                    
+                    # 记录扫描统计
+                    perf_stats['scanned'] += steps
+                    perf_stats['assigned'] += assigned_count
+                    
+                    # 更新游标位置，下次从停止的地方继续
+                    scan_cursor = (start_cursor + steps) % total_targets
+                    
+                    # 如果分配了任务，唤醒发送器
+                    if assigned_count > 0:
                         try:
-                            # 唤醒发送任务，尽快把新加入的绘画数据写出（事件驱动替代频繁 sleep）
                             paint_queue_event.set()
                         except Exception:
                             pass
-                        # 记录 pending paint，待画板更新广播到来时归属成功绘制
-                        try:
-                            image_idx = pos_to_image_idx.get(pick)
-                            pending_paints.append({
-                                'uid': uid,
-                                'paint_id': paint_id,
-                                'pos': (x, y),
-                                'color': (r, g, b),
-                                'time': time.monotonic(),
-                                'image_idx': image_idx
-                            })
-                            # 累计派发计数（按配置索引）
-                            if image_idx is not None:
-                                assigned_counter_per_image[image_idx] += 1
-                        except Exception as e:
-                            log_to_web_if_available(gui_state, f"记录pending paint时出错: {e}")
-
-                        # 【性能优化】在高速模式下减少日志输出，仅在 DEBUG 级别或每100次输出一次
-                        if debug or (paint_id % 100 == 0):
-                            logging.info(f"UID {uid} 播报绘制像素: ({x},{y}) color=({r},{g},{b}) id={paint_id}")
-                        else:
-                            logging.debug(f"UID {uid} 绘制: ({x},{y}) id={paint_id}")
-                        user_counters[uid] = paint_id + 1
-                        cooldown_until[uid] = now + user_cooldown_seconds
-                        assigned += 1
-
-                    # 输出轮次/进度日志
-                    round_idx += 1
-                    # 【性能优化】避免每轮都重新计算 left，使用估算值或周期性更新
-                    if round_idx % 10 == 0:
-                        left = len([pos for pos in target_positions if board_state.get(pos) != target_map[pos]])
-                        logging.info(f"第 {round_idx} 次调度：分配 {assigned} 个修复任务，剩余未达标 {left}。")
-                    else:
-                        logging.debug(f"第 {round_idx} 次调度：分配 {assigned} 个修复任务。")
-
-                # 计算等待策略
-                if not remaining:
-                    # 已全部达标，进入/保持监视模式
-                    if not in_watch_mode:
-                        logging.info("所有目标像素已达到目标颜色，进入监视模式：将持续监听画板偏移并即时修复。")
-                        in_watch_mode = True
-                    # 等待事件或超时，避免繁忙循环
-                    try:
-                        await asyncio.wait_for(state_changed_event.wait(), timeout=round_interval_seconds)
-                    except asyncio.TimeoutError:
-                        pass
-                    finally:
-                        state_changed_event.clear()
-                    continue
-
-                # 有未完成像素但本轮未能分配（可能因为都在冷却）
-                if remaining and assigned == 0:
-                    # 统计冷却剩余时间
-                    cool_list = []
-                    for user in users_with_tokens:
-                        uid = user['uid']
-                        rem = max(0.0, cooldown_until.get(uid, 0.0) - now)
-                        cool_list.append(f"{uid}:{int(rem)}s")
-                    logging.info("暂无可用用户，本轮跳过。冷却剩余：" + ", ".join(cool_list))
-
-                    # 计算下一个冷却到期或等待上限
-                    future_times = [cooldown_until[u['uid']] for u in users_with_tokens if cooldown_until[u['uid']] > now]
-                    next_ready_in = min([(t - now) for t in future_times], default=round_interval_seconds)
-                    # 之前这里强制最小等待 0.5s 会导致在 cooldown 非常低时（例如 0.05s）出现长时间空转，
-                    # 将最小等待缩短到一个很小的值以提高分配频率（例如 5ms）。
-                    timeout = max(0.005, min(round_interval_seconds, next_ready_in))
-                    try:
-                        await asyncio.wait_for(state_changed_event.wait(), timeout=timeout)
-                    except asyncio.TimeoutError:
-                        pass
-                    finally:
-                        state_changed_event.clear()
-                    continue
-
-                # 有分配则短暂让出控制权（粘包发送会在后台周期触发）
-                # 为避免每轮都阻塞 100ms（过长），改为短暂让出（例如 5ms 或根据 round_interval_seconds 缩放）
-                # 尽量缩小短等待，使用 asyncio.sleep(0) 作最小的让步以降低空转开销
-                sleep_dur = min(0.001, round_interval_seconds)
-                if sleep_dur <= 0:
-                    await asyncio.sleep(0)
+                
+                # 根据分配情况决定等待时间（优化：减少等待但避免CPU过载）
+                if assigned_count > 0:
+                    # 有分配任务，短暂yield给其他协程（避免霸占CPU）
+                    await asyncio.sleep(0.0001)  # 0.1ms
                 else:
-                    await asyncio.sleep(sleep_dur)
+                    # 没分配，可能所有目标都已达成或都在绘制中
+                    # 等待时间取决于是否还有未完成的目标和ready_tokens数量
+                    if len(pos_locks) > 0:
+                        # 有任务在执行中，等待任务超时或完成
+                        # 使用冷却时间的一小部分作为等待时间
+                        if user_cooldown_seconds < 0.1:
+                            # 极短冷却：等待1ms
+                            await asyncio.sleep(0.001)
+                        else:
+                            # 正常冷却：等待5ms
+                            await asyncio.sleep(0.005)
+                    else:
+                        # 可能所有都完成了，等待更长时间
+                        await asyncio.sleep(0.01)
 
             # 调度循环因检测到连接问题而退出，直接返回以便 run_forever 重连
             logging.info("调度循环退出，准备重连...")
@@ -1585,7 +2074,7 @@ async def handle_websocket(config, users_with_tokens, images_data, debug=False, 
         return 0.0
 
 
-async def run_forever(config, users_with_tokens, images_data, debug=False, gui_state=None):
+async def run_forever(config, users_with_tokens, images_data, debug=False, gui_state=None, custom_handler=None, precomputed_target=None):
     """带自动重连的持久运行包装器。
 
     当网络断开、服务器重启或偶发异常导致内部循环退出时，按指数回退重连，
@@ -1715,7 +2204,10 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
             else:
                 logging.info(f"尝试重新连接 WebSocket (第 {reconnect_count} 次尝试，累计成功连接: {successful_connections} 次，总连接时长: {total_connected_time:.1f}s)...")
             
-            duration = await handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state)
+            if custom_handler:
+                duration = await custom_handler(config, users_with_tokens, images_data)
+            else:
+                duration = await handle_websocket(config, users_with_tokens, images_data, debug, gui_state=gui_state, precomputed_target=precomputed_target)
             # handle_websocket 返回表示连接持续时间，连接结束后向 GUI 报告为断开（并给出原因为空或剩余信息）
             try:
                 if gui_state is not None:
@@ -1875,10 +2367,12 @@ async def run_forever(config, users_with_tokens, images_data, debug=False, gui_s
 
 def main_wrapper():
     """包装 main 函数，以便在重启时重新执行"""
-    # 解析命令行参数（支持 -debug、-cli 和端口设置）
+    # 解析命令行参数（支持 -debug、-cli、-test 和端口设置）
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('-debug', action='store_true', help='启用详细日志（DEBUG）并显示完整日志）')
     parser.add_argument('-cli', action='store_true', help='仅命令行模式，禁用 WebUI')
+    parser.add_argument('-hand', action='store_true', help='启用手动绘板模式')
+    parser.add_argument('-test', action='store_true', help='启用 Token 测量模式')
     parser.add_argument('-port', type=int, default=80, help='WebUI 端口（默认 80）')
     args, _ = parser.parse_known_args()
     
@@ -1889,6 +2383,7 @@ def main(args):
     """主函数"""
     debug = bool(args.debug)
     cli_only = bool(args.cli)
+    test_mode = bool(args.test)
 
     config = load_config()
     if not config:
@@ -1904,7 +2399,17 @@ def main(args):
     # 获取 token 阶段：在 GUI 模式下显示进度条避免无响应感
     def get_tokens_with_progress(users_list, allow_gui=True):
         results = []
-        total = len(users_list)
+        # 过滤掉已标记为失效的用户
+        active_users = [u for u in users_list if not u.get('invalid')]
+        
+        # 根据 max_enabled_tokens 限制用户数量
+        max_tokens = config.get('max_enabled_tokens', 0)
+        if max_tokens > 0 and len(active_users) > max_tokens:
+            logging.info(f"配置限制最大启用token数为 {max_tokens}，当前有 {len(active_users)} 个用户，仅加载前 {max_tokens} 个")
+            active_users = active_users[:max_tokens]
+        
+        total = len(active_users)
+        
         # 使用 rich 渲染 CLI 进度条
         root = None
         # 并发获取 token：对带 access_key 的用户并行调用 get_token，
@@ -1914,9 +2419,11 @@ def main(args):
 
         max_workers = min(32, max(1, total))
         idx = 0
+        config_changed = False
+
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             future_to_user = {}
-            for user in users_list:
+            for user in active_users:
                 uid = user.get('uid')
                 ak = user.get('access_key')
                 if ak:
@@ -1940,17 +2447,29 @@ def main(args):
                         token = fut.result()
                     except Exception:
                         token = None
+                    
                     if token:
                         results.append({'uid': uid, 'token': token})
                     else:
                         if ak:
-                            logging.warning(f"无法通过 access_key 获取 token: uid={uid}，该用户将被跳过。")
+                            logging.warning(f"无法通过 access_key 获取 token: uid={uid}，该用户将被标记为失效。")
+                            user['invalid'] = True
+                            config_changed = True
                         else:
                             logging.warning(f"用户条目缺少 access_key 且未提供 token: uid={uid}，跳过。")
                     p.advance(task)
 
         # 换行完成进度输出
         print('')
+        
+        if config_changed:
+            try:
+                with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(config, f, indent=4, ensure_ascii=False)
+                logging.info("配置已更新（标记了失效用户）。")
+            except Exception as e:
+                logging.error(f"保存配置失败: {e}")
+
         return results
 
     users_with_tokens = get_tokens_with_progress(config.get('users', []), allow_gui=True)
@@ -1976,66 +2495,30 @@ def main(args):
         validated.append({'uid': uid, 'token': token, 'token_bytes': token_bytes, 'uid_bytes3': uid_bytes3})
     users_with_tokens = validated
 
-    # --- 将 video 注入 images_data 作为高权重虚拟图片（动态帧由 tool.VIDEO_STATE 管理） ---
+    # 测试模式：在验证 token 后立即启动
+    if test_mode:
+        try:
+            import test_token
+            if not users_with_tokens:
+                logging.error("没有可用的 token，无法进行测试。")
+                print("\n❌ 错误：没有可用的用户 Token")
+                return
+            # 运行测试
+            asyncio.run(test_token.main_test(config, users_with_tokens))
+            return
+        except ImportError:
+            logging.error("找不到 test_token.py 插件，无法启动测试模式。")
+            print("\n❌ 错误：找不到 test_token.py 插件")
+            print("请确保 test_token.py 文件存在于程序目录中。")
+            return
+        except Exception as e:
+            logging.exception(f"测试模式出错: {e}")
+            print(f"\n❌ 测试模式运行失败: {e}")
+            return
+
+    # 视频功能已废弃
     try:
-        video_cfg = config.get('video') if isinstance(config, dict) else None
-        if isinstance(video_cfg, dict) and video_cfg.get('enabled', False):
-            folder = video_cfg.get('folder') or video_cfg.get('folder_path') or video_cfg.get('path')
-            if folder:
-                # 收集帧文件（按文件名中第一个数字排序）
-                try:
-                    files = [fn for fn in os.listdir(folder) if fn.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                except Exception:
-                    files = []
-                def _numkey(n):
-                    m = re.search(r"(\d+)", n)
-                    return int(m.group(1)) if m else float('inf')
-                files.sort(key=_numkey)
-                full_paths = [os.path.join(folder, f) for f in files]
-                if full_paths:
-                    fps_val = float(video_cfg.get('fps', 12.0))
-                    # 注册 VIDEO_STATE，使用 folder 作为 key
-                    try:
-                        complete_rate = float(video_cfg.get('complete_rate', video_cfg.get('completion_rate', 1.0)))
-                    except Exception:
-                        complete_rate = 1.0
-                    # clamp to [0,1]
-                    complete_rate = max(0.0, min(1.0, complete_rate))
-                    tool.VIDEO_STATE[folder] = {
-                        'folder': folder,
-                        'files': full_paths,
-                        'frame': 1,
-                        'frame_count': len(full_paths),
-                        'fps': fps_val,
-                        'loop': bool(video_cfg.get('loop', True)),
-                        'complete_rate': complete_rate
-                    }
-                    tool.VIDEO_FRAME_UPDATED = True
-
-                    # 插入为虚拟图片，权重设为很大以确保优先
-                    try:
-                        max_cfg_idx = max((img.get('config_index', i) for i, img in enumerate(images_data)), default=-1)
-                    except Exception:
-                        max_cfg_idx = len(images_data)
-                    vid_cfg_idx = int(max_cfg_idx) + 1
-                    # 强制使用随机绘制顺序以均匀分散派发，避免局部队列卡住导致帧推进延迟
-                    images_data.append({
-                        'type': 'video',
-                        'folder': folder,
-                        'start_x': int(video_cfg.get('start_x', video_cfg.get('startx', 0))),
-                        'start_y': int(video_cfg.get('start_y', video_cfg.get('starty', 0))),
-                        'draw_mode': 'random',
-                        'weight': float(video_cfg.get('weight', 1000000.0)),
-                        'enabled': True,
-                        'config_index': vid_cfg_idx
-                    })
-                    logging.info(f"已把视频注入为虚拟图片: folder={folder} frames={len(full_paths)} fps={fps_val}")
-
-                    # 视频的帧推进现在由主调度逻辑控制（仅在上一帧全部画完后推进），因此不再启动独立的更新时间线程。
-                else:
-                    logging.warning(f"视频目录中没有找到帧文件: {folder}")
-            else:
-                logging.warning('video 配置缺少 folder 字段')
+        pass
     except Exception:
         logging.exception("初始化视频注入时出错")
 
@@ -2100,6 +2583,15 @@ def main(args):
             t = threading.Thread(target=_auto_restart_worker, args=(auto_minutes, restart_stop_event), daemon=True, name='AutoRestartThread')
             t.start()
 
+        # 视频功能已废弃，直接预计算目标像素映射
+        precomputed_target = None
+        logging.info("正在预计算目标像素映射...")
+        try:
+            precomputed_target = tool.merge_target_maps(images_data)
+            logging.info("预计算完成。")
+        except Exception:
+            logging.exception("预计算目标像素映射失败")
+
         # 支持多线程/多进程 worker：按配置将 users_with_tokens 划分到多个 worker 中，
         # 每个 worker 维护独立的 asyncio 事件循环并运行完整的 run_forever，以提高并发发送吞吐量。
         thread_workers = 1
@@ -2130,7 +2622,7 @@ def main(args):
             procs = []
             try:
                 for i, grp in enumerate(groups):
-                    p = multiprocessing.Process(target=process_worker, args=(i, config, grp, images_data, debug), daemon=False)
+                    p = multiprocessing.Process(target=process_worker, args=(i, config, grp, images_data, debug, precomputed_target), daemon=False)
                     p.start()
                     procs.append(p)
 
@@ -2150,48 +2642,58 @@ def main(args):
                         pass
 
         elif thread_workers == 1:
-            asyncio.run(run_forever(config, users_with_tokens, images_data, debug))
+            if args.hand:
+                import hand_paint
+                asyncio.run(run_forever(config, users_with_tokens, images_data, debug, custom_handler=hand_paint.run_hand_paint))
+            else:
+                asyncio.run(run_forever(config, users_with_tokens, images_data, debug, precomputed_target=precomputed_target))
         else:
-            # 将 users_with_tokens 轮询分配到 N 个分片，保证尽量均衡
-            def partition_round_robin(items, parts):
-                groups = [[] for _ in range(parts)]
-                for i, it in enumerate(items):
-                    groups[i % parts].append(it)
-                return [g for g in groups if g]
+            # 如果是手动模式，强制单线程运行
+            if args.hand:
+                logging.info("手动模式下强制使用单线程。")
+                import hand_paint
+                asyncio.run(run_forever(config, users_with_tokens, images_data, debug, custom_handler=hand_paint.run_hand_paint))
+            else:
+                # 将 users_with_tokens 轮询分配到 N 个分片，保证尽量均衡
+                def partition_round_robin(items, parts):
+                    groups = [[] for _ in range(parts)]
+                    for i, it in enumerate(items):
+                        groups[i % parts].append(it)
+                    return [g for g in groups if g]
 
-            groups = partition_round_robin(users_with_tokens, thread_workers)
+                groups = partition_round_robin(users_with_tokens, thread_workers)
 
-            import threading as _threading
-            import asyncio as _asyncio
+                import threading as _threading
+                import asyncio as _asyncio
 
-            threads = []
+                threads = []
 
-            def _worker_thread(idx, cfg, users_sub, images_sub, dbg):
-                """每个线程创建独立的 asyncio loop 并运行 run_forever"""
-                try:
-                    loop = _asyncio.new_event_loop()
-                    _asyncio.set_event_loop(loop)
-                    loop.run_until_complete(run_forever(cfg, users_sub, images_sub, dbg))
-                except Exception:
-                    import logging as _logging
-                    _logging.exception(f"线程 worker #{idx} 出现未处理异常")
-                finally:
+                def _worker_thread(idx, cfg, users_sub, images_sub, dbg, precomputed_target=None):
+                    """每个线程创建独立的 asyncio loop 并运行 run_forever"""
                     try:
-                        loop.close()
+                        loop = _asyncio.new_event_loop()
+                        _asyncio.set_event_loop(loop)
+                        loop.run_until_complete(run_forever(cfg, users_sub, images_sub, dbg, precomputed_target=precomputed_target))
                     except Exception:
-                        pass
+                        import logging as _logging
+                        _logging.exception(f"线程 worker #{idx} 出现未处理异常")
+                    finally:
+                        try:
+                            loop.close()
+                        except Exception:
+                            pass
 
-            for i, grp in enumerate(groups):
-                t = _threading.Thread(target=_worker_thread, args=(i, config, grp, images_data, debug), daemon=False, name=f"WSWorker-{i}")
-                t.start()
-                threads.append(t)
+                for i, grp in enumerate(groups):
+                    t = _threading.Thread(target=_worker_thread, args=(i, config, grp, images_data, debug, precomputed_target), daemon=False, name=f"WSWorker-{i}")
+                    t.start()
+                    threads.append(t)
 
-            # 主线程等待所有 worker 线程结束（通常只有在用户停止或异常退出时）
-            try:
-                for t in threads:
-                    t.join()
-            except KeyboardInterrupt:
-                logging.info('收到 KeyboardInterrupt，等待子线程退出...')
+                # 主线程等待所有 worker 线程结束（通常只有在用户停止或异常退出时）
+                try:
+                    for t in threads:
+                        t.join()
+                except KeyboardInterrupt:
+                    logging.info('收到 KeyboardInterrupt，等待子线程退出...')
     except Exception as e:
         # 捕获顶层未处理异常，记录日志并尝试优雅停止后台任务
         logging.exception(f"主程序发生未处理异常: {e}")
