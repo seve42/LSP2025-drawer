@@ -47,8 +47,6 @@ pip install -r requirements.txt
 
 #### 1. 默认模式
 
-启动 Web 界面，默认端口 80：
-
 ```bash
 python main.py
 ```
@@ -83,7 +81,7 @@ python main.py -test
 | 字段 | 类型 | 说明 |
 |-----|-----|-----|
 | `uid` | number | 洛谷用户 ID |
-| `access_key` | string | AccessKey（从洛谷获取）|
+| `access_key` | string | AccessKey |
 
 ### 图片配置 (`images`)
 
